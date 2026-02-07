@@ -1,0 +1,309 @@
+import { useState, useCallback } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { useLocation } from "wouter";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import {
+  FolderUp,
+  FileCode,
+  Plus,
+  Trash2,
+  ArrowRight,
+  Upload,
+  Info,
+} from "lucide-react";
+
+interface FileEntry {
+  path: string;
+  content: string;
+  type: string;
+}
+
+function detectFileType(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const typeMap: Record<string, string> = {
+    java: "java",
+    vue: "vue",
+    jsx: "react",
+    tsx: "react",
+    ts: "typescript",
+    js: "javascript",
+    html: "html",
+    xml: "xml",
+  };
+  return typeMap[ext] || "other";
+}
+
+function FileTypeBadge({ type }: { type: string }) {
+  const colorMap: Record<string, string> = {
+    java: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300",
+    vue: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300",
+    react: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+    typescript: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+    javascript: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300",
+    html: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300",
+  };
+  return (
+    <span className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ${colorMap[type] || "bg-muted text-muted-foreground"}`}>
+      {type.toUpperCase()}
+    </span>
+  );
+}
+
+export default function UploadPage() {
+  const [, setLocation] = useLocation();
+  const { toast } = useToast();
+  const [projectName, setProjectName] = useState("");
+  const [description, setDescription] = useState("");
+  const [files, setFiles] = useState<FileEntry[]>([]);
+  const [currentPath, setCurrentPath] = useState("");
+  const [currentContent, setCurrentContent] = useState("");
+
+  const addFile = useCallback(() => {
+    if (!currentPath.trim() || !currentContent.trim()) {
+      toast({
+        title: "Missing information",
+        description: "Please provide both a file path and content.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const type = detectFileType(currentPath);
+    setFiles((prev) => [...prev, { path: currentPath.trim(), content: currentContent, type }]);
+    setCurrentPath("");
+    setCurrentContent("");
+  }, [currentPath, currentContent, toast]);
+
+  const removeFile = useCallback((index: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const uploadMutation = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/projects", {
+        name: projectName,
+        description,
+        files,
+      });
+      return res.json();
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/projects"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/stats"] });
+      toast({
+        title: "Project uploaded",
+        description: "Your project has been uploaded successfully.",
+      });
+      setLocation(`/catalog?projectId=${data.id}`);
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Upload failed",
+        description: error.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  const handleSubmit = () => {
+    if (!projectName.trim()) {
+      toast({
+        title: "Missing project name",
+        description: "Please enter a name for your project.",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (files.length === 0) {
+      toast({
+        title: "No files added",
+        description: "Please add at least one source file.",
+        variant: "destructive",
+      });
+      return;
+    }
+    uploadMutation.mutate();
+  };
+
+  const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const uploadedFiles = e.target.files;
+    if (!uploadedFiles) return;
+
+    const newFiles: FileEntry[] = [];
+    for (let i = 0; i < uploadedFiles.length; i++) {
+      const file = uploadedFiles[i];
+      const text = await file.text();
+      const path = file.webkitRelativePath || file.name;
+      const type = detectFileType(path);
+      newFiles.push({ path, content: text, type });
+    }
+    setFiles((prev) => [...prev, ...newFiles]);
+    e.target.value = "";
+  }, []);
+
+  return (
+    <div className="p-6 space-y-6 max-w-5xl mx-auto">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight" data-testid="text-upload-title">
+          Upload Project
+        </h1>
+        <p className="text-muted-foreground mt-1">
+          Add your frontend and Spring Boot backend source files for analysis
+        </p>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Project Details</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="project-name">Project Name</Label>
+            <Input
+              id="project-name"
+              placeholder="e.g., Customer Portal v2"
+              value={projectName}
+              onChange={(e) => setProjectName(e.target.value)}
+              data-testid="input-project-name"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="description">Description (optional)</Label>
+            <Textarea
+              id="description"
+              placeholder="Brief description of the project..."
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              className="resize-none"
+              data-testid="input-description"
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
+          <CardTitle className="text-base">Source Files</CardTitle>
+          <Badge variant="secondary" className="text-xs">
+            {files.length} file{files.length !== 1 ? "s" : ""} added
+          </Badge>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center gap-3 p-4 rounded-md bg-accent/50">
+            <Info className="h-4 w-4 text-muted-foreground shrink-0" />
+            <p className="text-xs text-muted-foreground">
+              Add Vue/React/Angular frontend files and Java Spring Boot backend files.
+              You can paste code directly or upload files from your machine.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="cursor-pointer" htmlFor="file-input">
+              <div className="flex items-center gap-1.5 text-sm font-medium text-primary hover:underline">
+                <Upload className="h-3.5 w-3.5" />
+                Upload files from disk
+              </div>
+              <input
+                id="file-input"
+                type="file"
+                multiple
+                accept=".java,.vue,.jsx,.tsx,.ts,.js,.html,.xml"
+                className="hidden"
+                onChange={handleFileUpload}
+                data-testid="input-file-upload"
+              />
+            </label>
+          </div>
+
+          <Separator />
+
+          <div className="space-y-3">
+            <p className="text-sm font-medium">Or paste code manually:</p>
+            <div className="space-y-2">
+              <Label htmlFor="file-path">File Path</Label>
+              <Input
+                id="file-path"
+                placeholder="e.g., src/main/java/com/app/UserController.java"
+                value={currentPath}
+                onChange={(e) => setCurrentPath(e.target.value)}
+                data-testid="input-file-path"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="file-content">File Content</Label>
+              <Textarea
+                id="file-content"
+                placeholder="Paste your source code here..."
+                value={currentContent}
+                onChange={(e) => setCurrentContent(e.target.value)}
+                className="font-mono text-xs min-h-[200px]"
+                data-testid="input-file-content"
+              />
+            </div>
+            <Button variant="outline" onClick={addFile} data-testid="button-add-file">
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              Add File
+            </Button>
+          </div>
+
+          {files.length > 0 && (
+            <>
+              <Separator />
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Added Files</p>
+                <div className="space-y-1">
+                  {files.map((file, index) => (
+                    <div
+                      key={index}
+                      className="flex items-center justify-between gap-2 p-2.5 rounded-md bg-accent/30"
+                      data-testid={`card-file-${index}`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <FileCode className="h-4 w-4 text-muted-foreground shrink-0" />
+                        <span className="text-sm font-mono truncate">{file.path}</span>
+                        <FileTypeBadge type={file.type} />
+                      </div>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => removeFile(index)}
+                        data-testid={`button-remove-file-${index}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      <div className="flex justify-end">
+        <Button
+          onClick={handleSubmit}
+          disabled={uploadMutation.isPending || files.length === 0 || !projectName.trim()}
+          data-testid="button-upload-project"
+        >
+          {uploadMutation.isPending ? (
+            "Uploading..."
+          ) : (
+            <>
+              <FolderUp className="h-4 w-4 mr-1.5" />
+              Upload & Analyze
+              <ArrowRight className="h-4 w-4 ml-1.5" />
+            </>
+          )}
+        </Button>
+      </div>
+    </div>
+  );
+}
