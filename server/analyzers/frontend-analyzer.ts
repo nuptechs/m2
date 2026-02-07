@@ -1,4 +1,6 @@
 import * as ts from "typescript";
+import * as vueSfc from "@vue/compiler-sfc";
+import * as ngCompiler from "@angular/compiler";
 import type { ApplicationGraph, GraphNode } from "./application-graph";
 
 export interface FrontendInteraction {
@@ -23,6 +25,13 @@ interface HttpCall {
   url: string;
   lineNumber: number;
   callerFunction: string | null;
+}
+
+interface TemplateBinding {
+  elementType: string;
+  eventType: string;
+  handlerName: string;
+  lineNumber: number;
 }
 
 function getComponentName(filePath: string): string {
@@ -192,79 +201,198 @@ function buildFunctionToHttpMap(httpCalls: HttpCall[]): Map<string, HttpCall[]> 
   return map;
 }
 
-function splitVueSFC(content: string): { template: string; script: string; templateOffset: number; scriptOffset: number } {
-  let template = "";
-  let script = "";
-  let templateOffset = 0;
+function buildASTFunctionCallMap(sourceFile: ts.SourceFile): Map<string, string[]> {
+  const callMap = new Map<string, string[]>();
+
+  function visit(node: ts.Node) {
+    let fnName: string | null = null;
+
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      fnName = node.name.text;
+    } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
+      fnName = node.name.text;
+    } else if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node))) {
+      const parent = node.parent;
+      if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+        fnName = parent.name.text;
+      } else if (ts.isPropertyAssignment(parent) && ts.isIdentifier(parent.name)) {
+        fnName = parent.name.text;
+      } else if (ts.isPropertyDeclaration(parent) && ts.isIdentifier(parent.name)) {
+        fnName = parent.name.text;
+      }
+    }
+
+    if (fnName) {
+      const calledFns: string[] = [];
+
+      const walkBody = (n: ts.Node) => {
+        if (ts.isCallExpression(n)) {
+          if (ts.isIdentifier(n.expression)) {
+            calledFns.push(n.expression.text);
+          } else if (ts.isPropertyAccessExpression(n.expression)) {
+            const obj = n.expression.expression;
+            if (obj.kind === ts.SyntaxKind.ThisKeyword || (ts.isIdentifier(obj) && obj.text === "this")) {
+              calledFns.push(n.expression.name.text);
+            }
+          }
+        }
+        ts.forEachChild(n, walkBody);
+      };
+
+      if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
+        if (node.body) walkBody(node.body);
+      } else if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+        walkBody(node.body);
+      }
+
+      callMap.set(fnName, calledFns);
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return callMap;
+}
+
+function findIndirectHttpCallsAST(
+  handlerName: string,
+  functionCallMap: Map<string, string[]>,
+  functionMap: Map<string, HttpCall[]>
+): HttpCall[] {
+  const visited = new Set<string>();
+  const results: HttpCall[] = [];
+
+  function trace(fnName: string) {
+    if (visited.has(fnName)) return;
+    visited.add(fnName);
+
+    const direct = functionMap.get(fnName);
+    if (direct) {
+      results.push(...direct);
+      return;
+    }
+
+    const calledFns = functionCallMap.get(fnName);
+    if (calledFns) {
+      for (const fn of calledFns) {
+        trace(fn);
+      }
+    }
+  }
+
+  trace(handlerName);
+  return results;
+}
+
+function parseVueTemplateAST(content: string): { bindings: TemplateBinding[]; scriptContent: string; scriptOffset: number } {
+  const sfcResult = vueSfc.parse(content);
+  const descriptor = sfcResult.descriptor;
+
+  const bindings: TemplateBinding[] = [];
+
+  if (descriptor.template && descriptor.template.ast) {
+    walkVueASTNode(descriptor.template.ast.children, bindings);
+  }
+
+  let scriptContent = "";
   let scriptOffset = 0;
-
-  const templateMatch = content.match(/<template[^>]*>([\s\S]*?)<\/template>/i);
-  if (templateMatch) {
-    template = templateMatch[1];
-    templateOffset = content.indexOf(templateMatch[0]) + templateMatch[0].indexOf(templateMatch[1]);
+  if (descriptor.scriptSetup) {
+    scriptContent = descriptor.scriptSetup.content;
+    scriptOffset = descriptor.scriptSetup.loc.start.line - 1;
+  } else if (descriptor.script) {
+    scriptContent = descriptor.script.content;
+    scriptOffset = descriptor.script.loc.start.line - 1;
   }
 
-  const scriptMatch = content.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
-  if (scriptMatch) {
-    script = scriptMatch[1];
-    scriptOffset = content.indexOf(scriptMatch[0]) + scriptMatch[0].indexOf(scriptMatch[1]);
+  return { bindings, scriptContent, scriptOffset };
+}
+
+function walkVueASTNode(nodes: any[], bindings: TemplateBinding[]): void {
+  for (const node of nodes) {
+    if (node.type === 1) {
+      const tagName = node.tag || "";
+      const elementType = classifyElement(tagName);
+
+      if (node.props) {
+        for (const prop of node.props) {
+          if (prop.type === 7 && prop.name === "on" && prop.arg) {
+            const eventType = prop.arg.content || "";
+            let handlerName = "";
+
+            if (prop.exp) {
+              const expContent = (prop.exp.content || "").trim();
+              const cleaned = expContent.replace(/\(.*\)$/, "").trim();
+              const dotIdx = cleaned.lastIndexOf(".");
+              handlerName = dotIdx >= 0 ? cleaned.substring(dotIdx + 1) : cleaned;
+            }
+
+            if (handlerName) {
+              bindings.push({
+                elementType,
+                eventType,
+                handlerName,
+                lineNumber: node.loc?.start?.line || 1,
+              });
+            }
+          }
+        }
+      }
+
+      if (node.children) {
+        walkVueASTNode(node.children, bindings);
+      }
+    }
   }
-
-  return { template, script, templateOffset, scriptOffset };
 }
 
-interface TemplateBinding {
-  elementType: string;
-  eventType: string;
-  handlerName: string;
-  lineNumber: number;
-}
+function parseAngularTemplateAST(templateContent: string): TemplateBinding[] {
+  const result = ngCompiler.parseTemplate(templateContent, "template.html", {
+    preserveWhitespaces: false,
+  });
 
-function parseVueTemplate(template: string, baseLineOffset: number): TemplateBinding[] {
   const bindings: TemplateBinding[] = [];
-  const tagRegex = /<([\w-]+)([^>]*)>/gi;
-  let tagMatch;
 
-  while ((tagMatch = tagRegex.exec(template)) !== null) {
-    const tagName = tagMatch[1].toLowerCase();
-    const attrs = tagMatch[2];
-    const lineNum = baseLineOffset + template.substring(0, tagMatch.index).split("\n").length;
+  function walkNodes(nodes: any[]): void {
+    for (const node of nodes) {
+      if (node.name !== undefined) {
+        const tagName = node.name || "";
+        const elementType = classifyElement(tagName);
 
-    const elementType = classifyElement(tagName);
+        if (node.outputs) {
+          for (const output of node.outputs) {
+            const eventType = output.name || "";
+            let handlerName = "";
 
-    const vueEventRegex = /@([\w.]+)\s*=\s*["']([^"']+)["']/g;
-    let eventMatch;
-    while ((eventMatch = vueEventRegex.exec(attrs)) !== null) {
-      const eventType = eventMatch[1].replace(/\.prevent|\.stop|\.self/g, "");
-      let handlerName = eventMatch[2].trim();
-      handlerName = handlerName.replace(/\(.*\)$/, "");
-      bindings.push({ elementType, eventType, handlerName, lineNumber: lineNum });
+            if (output.handler) {
+              const source = (output.handler.source || "").trim();
+              const cleaned = source.replace(/\(.*\)$/, "").trim();
+              const dotIdx = cleaned.lastIndexOf(".");
+              handlerName = dotIdx >= 0 ? cleaned.substring(dotIdx + 1) : cleaned;
+            }
+
+            if (handlerName) {
+              bindings.push({
+                elementType,
+                eventType,
+                handlerName,
+                lineNumber: output.sourceSpan?.start?.line != null
+                  ? output.sourceSpan.start.line + 1
+                  : 1,
+              });
+            }
+          }
+        }
+
+        if (node.children) {
+          walkNodes(node.children);
+        }
+      }
     }
   }
 
-  return bindings;
-}
-
-function parseAngularTemplate(template: string, baseLineOffset: number): TemplateBinding[] {
-  const bindings: TemplateBinding[] = [];
-  const tagRegex = /<([\w-]+)([^>]*)>/gi;
-  let tagMatch;
-
-  while ((tagMatch = tagRegex.exec(template)) !== null) {
-    const tagName = tagMatch[1].toLowerCase();
-    const attrs = tagMatch[2];
-    const lineNum = baseLineOffset + template.substring(0, tagMatch.index).split("\n").length;
-
-    const elementType = classifyElement(tagName);
-
-    const angularEventRegex = /\(([\w.]+)\)\s*=\s*["']([^"']+)["']/g;
-    let eventMatch;
-    while ((eventMatch = angularEventRegex.exec(attrs)) !== null) {
-      const eventType = eventMatch[1];
-      let handlerName = eventMatch[2].trim();
-      handlerName = handlerName.replace(/\(.*\)$/, "");
-      bindings.push({ elementType, eventType, handlerName, lineNumber: lineNum });
-    }
+  if (result.nodes) {
+    walkNodes(result.nodes);
   }
 
   return bindings;
@@ -444,30 +572,17 @@ function endpointMatchScore(frontendUrl: string, backendPath: string): number {
   return (matchCount / frontParts.length) * 100;
 }
 
-function analyzeVueFile(
+function resolveBindingsToInteractions(
+  bindings: TemplateBinding[],
+  functionMap: Map<string, HttpCall[]>,
+  functionCallMap: Map<string, string[]>,
+  component: string,
   filePath: string,
-  content: string,
   graph: ApplicationGraph
 ): FrontendInteraction[] {
-  const component = getComponentName(filePath);
-  const { template, script, templateOffset, scriptOffset } = splitVueSFC(content);
-
-  const templateLineOffset = content.substring(0, templateOffset).split("\n").length - 1;
-  const templateBindings = parseVueTemplate(template, templateLineOffset);
-
-  let scriptSource: ts.SourceFile | null = null;
-  let httpCalls: HttpCall[] = [];
-  let functionMap = new Map<string, HttpCall[]>();
-
-  if (script.trim()) {
-    scriptSource = parseTypeScript(script, filePath + ".script.ts");
-    httpCalls = extractHttpCallsFromAST(scriptSource);
-    functionMap = buildFunctionToHttpMap(httpCalls);
-  }
-
   const interactions: FrontendInteraction[] = [];
 
-  for (const binding of templateBindings) {
+  for (const binding of bindings) {
     const callsInHandler = functionMap.get(binding.handlerName) || [];
 
     if (callsInHandler.length > 0) {
@@ -485,7 +600,7 @@ function analyzeVueFile(
         });
       }
     } else {
-      const indirectCalls = findIndirectHttpCalls(binding.handlerName, script, functionMap);
+      const indirectCalls = findIndirectHttpCallsAST(binding.handlerName, functionCallMap, functionMap);
       if (indirectCalls.length > 0) {
         for (const call of indirectCalls) {
           const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
@@ -515,76 +630,36 @@ function analyzeVueFile(
     }
   }
 
-  addUnmappedHttpCalls(interactions, httpCalls, component, filePath, graph);
-
   return interactions;
 }
 
-function findIndirectHttpCalls(
-  handlerName: string,
-  scriptCode: string,
-  functionMap: Map<string, HttpCall[]>
-): HttpCall[] {
-  const visited = new Set<string>();
-  const results: HttpCall[] = [];
+function analyzeVueFile(
+  filePath: string,
+  content: string,
+  graph: ApplicationGraph
+): FrontendInteraction[] {
+  const component = getComponentName(filePath);
 
-  function trace(fnName: string) {
-    if (visited.has(fnName)) return;
-    visited.add(fnName);
+  const { bindings: templateBindings, scriptContent, scriptOffset } = parseVueTemplateAST(content);
 
-    const direct = functionMap.get(fnName);
-    if (direct) {
-      results.push(...direct);
-      return;
-    }
+  let httpCalls: HttpCall[] = [];
+  let functionMap = new Map<string, HttpCall[]>();
+  let functionCallMap = new Map<string, string[]>();
 
-    const callPattern = new RegExp(
-      `(?:async\\s+)?(?:function\\s+)?${escapeRegex(fnName)}\\s*\\([^)]*\\)\\s*\\{([\\s\\S]*?)\\n\\s*\\}`,
-      "m"
-    );
-    const bodyMatch = scriptCode.match(callPattern);
-    if (!bodyMatch) {
-      const methodPattern = new RegExp(
-        `${escapeRegex(fnName)}\\s*\\([^)]*\\)\\s*\\{([\\s\\S]*?)\\n\\s{4}\\}`,
-        "m"
-      );
-      const methodMatch = scriptCode.match(methodPattern);
-      if (methodMatch) {
-        const body = methodMatch[1];
-        const calledFns = extractCalledFunctions(body);
-        for (const fn of calledFns) {
-          trace(fn);
-        }
-      }
-      return;
-    }
-
-    const body = bodyMatch[1];
-    const calledFns = extractCalledFunctions(body);
-    for (const fn of calledFns) {
-      trace(fn);
-    }
+  if (scriptContent.trim()) {
+    const scriptSource = parseTypeScript(scriptContent, filePath + ".script.ts");
+    httpCalls = extractHttpCallsFromAST(scriptSource);
+    functionMap = buildFunctionToHttpMap(httpCalls);
+    functionCallMap = buildASTFunctionCallMap(scriptSource);
   }
 
-  trace(handlerName);
-  return results;
-}
+  const interactions = resolveBindingsToInteractions(
+    templateBindings, functionMap, functionCallMap, component, filePath, graph
+  );
 
-function extractCalledFunctions(body: string): string[] {
-  const fns: string[] = [];
-  const callRegex = /(?:this\.)?(\w+)\s*\(/g;
-  let m;
-  while ((m = callRegex.exec(body)) !== null) {
-    const name = m[1];
-    if (!["if", "else", "for", "while", "switch", "return", "await", "new", "console", "window", "document", "Math", "JSON", "Object", "Array", "Promise", "setTimeout", "setInterval", "parseInt", "parseFloat"].includes(name)) {
-      fns.push(name);
-    }
-  }
-  return fns;
-}
+  addUnmappedHttpCalls(interactions, httpCalls, component, filePath, graph);
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return interactions;
 }
 
 function analyzeReactFile(
@@ -596,57 +671,12 @@ function analyzeReactFile(
   const sourceFile = parseTypeScript(content, filePath);
   const httpCalls = extractHttpCallsFromAST(sourceFile);
   const functionMap = buildFunctionToHttpMap(httpCalls);
+  const functionCallMap = buildASTFunctionCallMap(sourceFile);
   const jsxBindings = parseJSXTemplate(sourceFile);
 
-  const interactions: FrontendInteraction[] = [];
-
-  for (const binding of jsxBindings) {
-    const callsInHandler = functionMap.get(binding.handlerName) || [];
-
-    if (callsInHandler.length > 0) {
-      for (const call of callsInHandler) {
-        const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
-        interactions.push({
-          component,
-          elementType: binding.elementType,
-          actionName: binding.handlerName,
-          httpMethod: call.method,
-          url: call.url,
-          mappedBackendNode: backendNode,
-          sourceFile: filePath,
-          lineNumber: binding.lineNumber,
-        });
-      }
-    } else {
-      const indirectCalls = findIndirectHttpCalls(binding.handlerName, content, functionMap);
-      if (indirectCalls.length > 0) {
-        for (const call of indirectCalls) {
-          const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
-          interactions.push({
-            component,
-            elementType: binding.elementType,
-            actionName: binding.handlerName,
-            httpMethod: call.method,
-            url: call.url,
-            mappedBackendNode: backendNode,
-            sourceFile: filePath,
-            lineNumber: binding.lineNumber,
-          });
-        }
-      } else {
-        interactions.push({
-          component,
-          elementType: binding.elementType,
-          actionName: binding.handlerName,
-          httpMethod: null,
-          url: null,
-          mappedBackendNode: null,
-          sourceFile: filePath,
-          lineNumber: binding.lineNumber,
-        });
-      }
-    }
-  }
+  const interactions = resolveBindingsToInteractions(
+    jsxBindings, functionMap, functionCallMap, component, filePath, graph
+  );
 
   addUnmappedHttpCalls(interactions, httpCalls, component, filePath, graph);
 
@@ -663,7 +693,7 @@ function analyzeAngularFile(
   const interactions: FrontendInteraction[] = [];
 
   if (filePath.endsWith(".html")) {
-    const bindings = parseAngularTemplate(content, 0);
+    const bindings = parseAngularTemplateAST(content);
     for (const binding of bindings) {
       interactions.push({
         component,
@@ -682,73 +712,69 @@ function analyzeAngularFile(
   const sourceFile = parseTypeScript(content, filePath);
   const httpCalls = extractHttpCallsFromAST(sourceFile);
   const functionMap = buildFunctionToHttpMap(httpCalls);
+  const functionCallMap = buildASTFunctionCallMap(sourceFile);
 
   let templateContent = "";
-  const templateUrlMatch = content.match(/templateUrl\s*:\s*['"]([^'"]+)['"]/);
-  if (templateUrlMatch) {
-    const templatePath = templateUrlMatch[1];
+
+  const templateUrlNode = findDecoratorProperty(sourceFile, "templateUrl");
+  if (templateUrlNode && ts.isStringLiteral(templateUrlNode)) {
+    const templatePath = templateUrlNode.text;
     const resolvedPath = resolveTemplatePath(filePath, templatePath);
     templateContent = htmlTemplates.get(resolvedPath) || "";
   }
-  const inlineTemplateMatch = content.match(/template\s*:\s*`([\s\S]*?)`/);
-  if (inlineTemplateMatch) {
-    templateContent = inlineTemplateMatch[1];
+
+  if (!templateContent) {
+    const templateNode = findDecoratorProperty(sourceFile, "template");
+    if (templateNode) {
+      if (ts.isNoSubstitutionTemplateLiteral(templateNode)) {
+        templateContent = templateNode.text;
+      } else if (ts.isStringLiteral(templateNode)) {
+        templateContent = templateNode.text;
+      } else if (ts.isTemplateExpression(templateNode)) {
+        templateContent = templateNode.getText(sourceFile).replace(/^`|`$/g, "");
+      }
+    }
   }
 
   if (templateContent) {
-    const templateBindings = parseAngularTemplate(templateContent, 0);
-    for (const binding of templateBindings) {
-      const callsInHandler = functionMap.get(binding.handlerName) || [];
-
-      if (callsInHandler.length > 0) {
-        for (const call of callsInHandler) {
-          const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
-          interactions.push({
-            component,
-            elementType: binding.elementType,
-            actionName: binding.handlerName,
-            httpMethod: call.method,
-            url: call.url,
-            mappedBackendNode: backendNode,
-            sourceFile: filePath,
-            lineNumber: binding.lineNumber,
-          });
-        }
-      } else {
-        const indirectCalls = findIndirectHttpCalls(binding.handlerName, content, functionMap);
-        if (indirectCalls.length > 0) {
-          for (const call of indirectCalls) {
-            const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
-            interactions.push({
-              component,
-              elementType: binding.elementType,
-              actionName: binding.handlerName,
-              httpMethod: call.method,
-              url: call.url,
-              mappedBackendNode: backendNode,
-              sourceFile: filePath,
-              lineNumber: binding.lineNumber,
-            });
-          }
-        } else {
-          interactions.push({
-            component,
-            elementType: binding.elementType,
-            actionName: binding.handlerName,
-            httpMethod: null,
-            url: null,
-            mappedBackendNode: null,
-            sourceFile: filePath,
-            lineNumber: binding.lineNumber,
-          });
-        }
-      }
-    }
+    const templateBindings = parseAngularTemplateAST(templateContent);
+    const resolved = resolveBindingsToInteractions(
+      templateBindings, functionMap, functionCallMap, component, filePath, graph
+    );
+    interactions.push(...resolved);
   }
 
   addUnmappedHttpCalls(interactions, httpCalls, component, filePath, graph);
 
   return interactions;
+}
+
+function findDecoratorProperty(sourceFile: ts.SourceFile, propertyName: string): ts.Expression | null {
+  let result: ts.Expression | null = null;
+
+  function visit(node: ts.Node) {
+    if (result) return;
+
+    if (ts.isDecorator(node) && ts.isCallExpression(node.expression)) {
+      const decoratorName = node.expression.expression.getText(sourceFile);
+      if (decoratorName === "Component") {
+        for (const arg of node.expression.arguments) {
+          if (ts.isObjectLiteralExpression(arg)) {
+            for (const prop of arg.properties) {
+              if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === propertyName) {
+                result = prop.initializer;
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return result;
 }
 
 function resolveTemplatePath(componentPath: string, templateUrl: string): string {
@@ -849,7 +875,7 @@ export function analyzeFrontend(
           break;
 
         case "html":
-          const bindings = parseAngularTemplate(file.content, 0);
+          const bindings = parseAngularTemplateAST(file.content);
           const component = getComponentName(file.filePath);
           for (const binding of bindings) {
             interactions.push({
@@ -865,8 +891,8 @@ export function analyzeFrontend(
           }
           break;
       }
-    } catch {
-      // skip unparseable files
+    } catch (err) {
+      console.error(`[frontend-analyzer] Error analyzing ${file.filePath}:`, err instanceof Error ? err.message : err);
     }
   }
 

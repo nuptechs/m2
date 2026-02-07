@@ -1,0 +1,582 @@
+package com.permacat.analyzer;
+
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParseResult;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.*;
+import com.github.javaparser.ast.expr.*;
+import com.github.javaparser.ast.stmt.*;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+import com.permacat.model.*;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class JavaASTAnalyzer {
+
+    private static final Set<String> CONTROLLER_ANNOTATIONS = Set.of(
+        "RestController", "Controller"
+    );
+    private static final Set<String> SERVICE_ANNOTATIONS = Set.of(
+        "Service", "Component"
+    );
+    private static final Set<String> REPOSITORY_ANNOTATIONS = Set.of(
+        "Repository"
+    );
+    private static final Set<String> ENTITY_ANNOTATIONS = Set.of(
+        "Entity", "Table", "Document"
+    );
+    private static final Set<String> MAPPING_ANNOTATIONS = Set.of(
+        "RequestMapping", "GetMapping", "PostMapping", "PutMapping",
+        "DeleteMapping", "PatchMapping"
+    );
+    private static final Set<String> INJECT_ANNOTATIONS = Set.of(
+        "Autowired", "Inject", "Resource"
+    );
+    private static final Set<String> REPO_INTERFACES = Set.of(
+        "JpaRepository", "CrudRepository", "PagingAndSortingRepository",
+        "MongoRepository", "ReactiveCrudRepository", "Repository"
+    );
+    private static final Set<String> PERSISTENCE_SAVE = Set.of(
+        "save", "saveAll", "saveAndFlush", "insert", "create", "persist", "merge", "update"
+    );
+    private static final Set<String> PERSISTENCE_DELETE = Set.of(
+        "delete", "deleteById", "deleteAll", "deleteAllById", "remove", "removeById"
+    );
+    private static final Set<String> PERSISTENCE_READ = Set.of(
+        "findById", "findAll", "findOne", "getById", "getReferenceById",
+        "getOne", "existsById", "count", "findAllById"
+    );
+
+    private final Map<String, ClassInfo> classMap = new HashMap<>();
+
+    public AnalysisResult analyze(Map<String, String> files) {
+        JavaParser parser = new JavaParser();
+
+        for (Map.Entry<String, String> entry : files.entrySet()) {
+            String filePath = entry.getKey();
+            String content = entry.getValue();
+            try {
+                ParseResult<CompilationUnit> result = parser.parse(content);
+                if (result.isSuccessful() && result.getResult().isPresent()) {
+                    CompilationUnit cu = result.getResult().get();
+                    extractClassInfo(cu, filePath);
+                }
+            } catch (Exception e) {
+                System.err.println("Failed to parse: " + filePath + " - " + e.getMessage());
+            }
+        }
+
+        return buildGraph();
+    }
+
+    private void extractClassInfo(CompilationUnit cu, String filePath) {
+        String packageName = cu.getPackageDeclaration()
+            .map(pd -> pd.getNameAsString())
+            .orElse("");
+
+        for (ClassOrInterfaceDeclaration cls : cu.findAll(ClassOrInterfaceDeclaration.class)) {
+            ClassInfo info = new ClassInfo();
+            info.className = cls.getNameAsString();
+            info.packageName = packageName;
+            info.sourceFile = filePath;
+            info.isInterface = cls.isInterface();
+
+            List<String> annotations = cls.getAnnotations().stream()
+                .map(a -> a.getNameAsString())
+                .collect(Collectors.toList());
+
+            info.isController = annotations.stream().anyMatch(CONTROLLER_ANNOTATIONS::contains);
+            info.isService = annotations.stream().anyMatch(SERVICE_ANNOTATIONS::contains);
+            info.isRepository = annotations.stream().anyMatch(REPOSITORY_ANNOTATIONS::contains);
+            info.isEntity = annotations.stream().anyMatch(ENTITY_ANNOTATIONS::contains);
+
+            if (!info.isRepository && cls.isInterface()) {
+                for (ClassOrInterfaceType ext : cls.getExtendedTypes()) {
+                    if (REPO_INTERFACES.contains(ext.getNameAsString())) {
+                        info.isRepository = true;
+                        break;
+                    }
+                }
+                for (ClassOrInterfaceType impl : cls.getImplementedTypes()) {
+                    if (REPO_INTERFACES.contains(impl.getNameAsString())) {
+                        info.isRepository = true;
+                        break;
+                    }
+                }
+            }
+
+            String classLevelPath = "";
+            for (AnnotationExpr ann : cls.getAnnotations()) {
+                if (ann.getNameAsString().equals("RequestMapping")) {
+                    classLevelPath = extractMappingPath(ann);
+                }
+            }
+            info.basePath = classLevelPath;
+
+            if (info.isEntity) {
+                extractEntityFields(cls, info);
+            }
+
+            extractInjectedFields(cls, info);
+            extractMethods(cls, info);
+
+            classMap.put(info.className, info);
+        }
+    }
+
+    private void extractEntityFields(ClassOrInterfaceDeclaration cls, ClassInfo info) {
+        for (FieldDeclaration field : cls.getFields()) {
+            for (VariableDeclarator var : field.getVariables()) {
+                EntityField ef = new EntityField();
+                ef.name = var.getNameAsString();
+                ef.type = var.getTypeAsString();
+                ef.isId = field.getAnnotations().stream()
+                    .anyMatch(a -> a.getNameAsString().equals("Id") || a.getNameAsString().equals("EmbeddedId"));
+                info.entityFields.add(ef);
+            }
+        }
+    }
+
+    private void extractInjectedFields(ClassOrInterfaceDeclaration cls, ClassInfo info) {
+        for (FieldDeclaration field : cls.getFields()) {
+            boolean isInjected = field.getAnnotations().stream()
+                .anyMatch(a -> INJECT_ANNOTATIONS.contains(a.getNameAsString()));
+            if (isInjected) {
+                for (VariableDeclarator var : field.getVariables()) {
+                    info.injectedFields.put(var.getNameAsString(), var.getTypeAsString());
+                }
+            }
+        }
+
+        for (ConstructorDeclaration ctor : cls.getConstructors()) {
+            for (Parameter param : ctor.getParameters()) {
+                String typeName = param.getTypeAsString();
+                if (typeName.endsWith("Service") || typeName.endsWith("Repository") ||
+                    typeName.endsWith("Repo") || typeName.endsWith("Client") ||
+                    typeName.endsWith("Mapper") || typeName.endsWith("Converter") ||
+                    typeName.endsWith("Dao") || typeName.endsWith("DAO")) {
+                    info.injectedFields.put(param.getNameAsString(), typeName);
+                }
+            }
+        }
+    }
+
+    private void extractMethods(ClassOrInterfaceDeclaration cls, ClassInfo info) {
+        for (MethodDeclaration method : cls.getMethods()) {
+            MethodInfo mi = new MethodInfo();
+            mi.name = method.getNameAsString();
+            mi.returnType = method.getTypeAsString();
+            mi.parameters = method.getParameters().stream()
+                .map(p -> p.getTypeAsString() + " " + p.getNameAsString())
+                .collect(Collectors.toList());
+
+            List<String> methodAnnotations = method.getAnnotations().stream()
+                .map(a -> a.getNameAsString())
+                .collect(Collectors.toList());
+
+            for (AnnotationExpr ann : method.getAnnotations()) {
+                String annName = ann.getNameAsString();
+                if (MAPPING_ANNOTATIONS.contains(annName)) {
+                    mi.httpMethod = resolveHttpMethod(annName, ann);
+                    String methodPath = extractMappingPath(ann);
+                    mi.httpPath = combinePaths(info.basePath, methodPath);
+                    break;
+                }
+            }
+
+            if (method.getBody().isPresent()) {
+                BlockStmt body = method.getBody().get();
+                extractMethodCalls(body, mi, info);
+                detectEntityMutations(body, mi);
+            }
+
+            info.methods.add(mi);
+        }
+    }
+
+    private void extractMethodCalls(BlockStmt body, MethodInfo mi, ClassInfo cls) {
+        body.accept(new VoidVisitorAdapter<Void>() {
+            @Override
+            public void visit(MethodCallExpr callExpr, Void arg) {
+                super.visit(callExpr, arg);
+                MethodCallInfo mci = new MethodCallInfo();
+                mci.methodName = callExpr.getNameAsString();
+
+                if (callExpr.getScope().isPresent()) {
+                    Expression scope = callExpr.getScope().get();
+                    if (scope instanceof NameExpr) {
+                        mci.targetVariable = ((NameExpr) scope).getNameAsString();
+                    } else if (scope instanceof ThisExpr) {
+                        mci.targetVariable = "this";
+                    } else if (scope instanceof FieldAccessExpr) {
+                        mci.targetVariable = ((FieldAccessExpr) scope).getNameAsString();
+                    } else if (scope instanceof MethodCallExpr) {
+                        mci.targetVariable = "__chained__";
+                    }
+                } else {
+                    mci.targetVariable = "this";
+                }
+
+                mi.methodCalls.add(mci);
+            }
+        }, null);
+    }
+
+    private void detectEntityMutations(BlockStmt body, MethodInfo mi) {
+        body.accept(new VoidVisitorAdapter<Void>() {
+            @Override
+            public void visit(MethodCallExpr callExpr, Void arg) {
+                super.visit(callExpr, arg);
+                String name = callExpr.getNameAsString();
+                if (name.startsWith("set") && name.length() > 3 && Character.isUpperCase(name.charAt(3))) {
+                    mi.hasEntityMutations = true;
+                }
+            }
+        }, null);
+    }
+
+    private String resolveHttpMethod(String annotationName, AnnotationExpr ann) {
+        switch (annotationName) {
+            case "GetMapping": return "GET";
+            case "PostMapping": return "POST";
+            case "PutMapping": return "PUT";
+            case "DeleteMapping": return "DELETE";
+            case "PatchMapping": return "PATCH";
+            case "RequestMapping":
+                if (ann instanceof NormalAnnotationExpr) {
+                    for (MemberValuePair pair : ((NormalAnnotationExpr) ann).getPairs()) {
+                        if (pair.getNameAsString().equals("method")) {
+                            String val = pair.getValue().toString();
+                            if (val.contains("GET")) return "GET";
+                            if (val.contains("POST")) return "POST";
+                            if (val.contains("PUT")) return "PUT";
+                            if (val.contains("DELETE")) return "DELETE";
+                            if (val.contains("PATCH")) return "PATCH";
+                        }
+                    }
+                }
+                return "GET";
+            default: return "GET";
+        }
+    }
+
+    private String extractMappingPath(AnnotationExpr ann) {
+        if (ann instanceof SingleMemberAnnotationExpr) {
+            return cleanPath(((SingleMemberAnnotationExpr) ann).getMemberValue().toString());
+        }
+        if (ann instanceof NormalAnnotationExpr) {
+            for (MemberValuePair pair : ((NormalAnnotationExpr) ann).getPairs()) {
+                String key = pair.getNameAsString();
+                if (key.equals("value") || key.equals("path")) {
+                    return cleanPath(pair.getValue().toString());
+                }
+            }
+        }
+        if (ann instanceof MarkerAnnotationExpr) {
+            return "";
+        }
+        return "";
+    }
+
+    private String cleanPath(String raw) {
+        String path = raw.replace("\"", "").replace("{", "").replace("}", "").trim();
+        if (path.startsWith("/")) return path;
+        if (!path.isEmpty()) return "/" + path;
+        return "";
+    }
+
+    private String combinePaths(String base, String methodPath) {
+        String combined = (base + methodPath).replaceAll("/+", "/");
+        if (!combined.startsWith("/")) combined = "/" + combined;
+        if (combined.endsWith("/") && combined.length() > 1) {
+            combined = combined.substring(0, combined.length() - 1);
+        }
+        return combined;
+    }
+
+    private AnalysisResult buildGraph() {
+        List<GraphNodeDTO> nodes = new ArrayList<>();
+        List<GraphEdgeDTO> edges = new ArrayList<>();
+        Set<String> nodeIds = new HashSet<>();
+        Set<String> edgeKeys = new HashSet<>();
+
+        for (ClassInfo cls : classMap.values()) {
+            if (cls.isEntity) {
+                GraphNodeDTO entityNode = new GraphNodeDTO("ENTITY", cls.className, cls.className);
+                entityNode.metadata.put("sourceFile", cls.sourceFile);
+                entityNode.metadata.put("fields", cls.entityFields.stream()
+                    .map(f -> f.name + ":" + f.type)
+                    .collect(Collectors.toList()));
+                if (nodeIds.add(entityNode.id)) {
+                    nodes.add(entityNode);
+                }
+            }
+        }
+
+        for (ClassInfo cls : classMap.values()) {
+            if (cls.isEntity) continue;
+
+            String nodeType;
+            if (cls.isController) nodeType = "CONTROLLER";
+            else if (cls.isService) nodeType = "SERVICE";
+            else if (cls.isRepository) nodeType = "REPOSITORY";
+            else continue;
+
+            if (cls.isRepository) {
+                GraphNodeDTO repoNode = new GraphNodeDTO("REPOSITORY", cls.className, cls.className);
+                repoNode.metadata.put("sourceFile", cls.sourceFile);
+                if (nodeIds.add(repoNode.id)) {
+                    nodes.add(repoNode);
+                }
+
+                String entityName = cls.className
+                    .replaceAll("Repository$", "")
+                    .replaceAll("Repo$", "");
+                String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+                if (nodeIds.contains(entityNodeId)) {
+                    String edgeKey = repoNode.id + "->" + entityNodeId + ":READS_ENTITY";
+                    if (edgeKeys.add(edgeKey)) {
+                        edges.add(new GraphEdgeDTO(repoNode.id, entityNodeId, "READS_ENTITY",
+                            Map.of("operation", "read")));
+                    }
+                }
+            }
+
+            for (MethodInfo method : cls.methods) {
+                if (cls.isController && method.httpMethod == null) continue;
+
+                Map<String, Object> meta = new HashMap<>();
+                meta.put("sourceFile", cls.sourceFile);
+                if (method.httpMethod != null) {
+                    meta.put("httpMethod", method.httpMethod);
+                    meta.put("fullPath", method.httpPath);
+                }
+                meta.put("returnType", method.returnType);
+                meta.put("parameters", method.parameters);
+
+                GraphNodeDTO node = new GraphNodeDTO(nodeType, cls.className, method.name, meta);
+                if (nodeIds.add(node.id)) {
+                    nodes.add(node);
+                }
+            }
+        }
+
+        for (ClassInfo cls : classMap.values()) {
+            if (cls.isEntity) continue;
+
+            String nodeType;
+            if (cls.isController) nodeType = "CONTROLLER";
+            else if (cls.isService) nodeType = "SERVICE";
+            else if (cls.isRepository) nodeType = "REPOSITORY";
+            else continue;
+
+            for (MethodInfo method : cls.methods) {
+                if (cls.isController && method.httpMethod == null) continue;
+
+                String fromId = nodeType + ":" + cls.className + "." + method.name;
+                if (!nodeIds.contains(fromId)) continue;
+
+                for (MethodCallInfo call : method.methodCalls) {
+                    String targetType = resolveTargetType(call.targetVariable, cls);
+                    ClassInfo targetClass = targetType != null ? classMap.get(targetType) : null;
+
+                    if (targetClass != null) {
+                        processMethodCall(fromId, call, targetClass, nodes, edges, nodeIds, edgeKeys);
+                    } else if ("this".equals(call.targetVariable)) {
+                        String toId = nodeType + ":" + cls.className + "." + call.methodName;
+                        if (nodeIds.contains(toId)) {
+                            addEdge(edges, edgeKeys, fromId, toId, "CALLS", null);
+                        }
+                    } else if (call.targetVariable != null && !call.targetVariable.equals("__chained__")) {
+                        String injectedType = cls.injectedFields.get(call.targetVariable);
+                        if (injectedType != null) {
+                            ClassInfo injectedClass = classMap.get(injectedType);
+                            if (injectedClass != null) {
+                                processMethodCall(fromId, call, injectedClass, nodes, edges, nodeIds, edgeKeys);
+                            } else if (injectedType.endsWith("Repository") || injectedType.endsWith("Repo")) {
+                                handleSyntheticRepoCall(fromId, call, injectedType, nodes, edges, nodeIds, edgeKeys);
+                            }
+                        }
+                    }
+                }
+
+                if (method.hasEntityMutations) {
+                    handleEntityMutations(fromId, cls, edges, nodeIds, edgeKeys);
+                }
+            }
+        }
+
+        return new AnalysisResult(nodes, edges);
+    }
+
+    private void processMethodCall(String fromId, MethodCallInfo call, ClassInfo targetClass,
+                                   List<GraphNodeDTO> nodes, List<GraphEdgeDTO> edges,
+                                   Set<String> nodeIds, Set<String> edgeKeys) {
+        if (targetClass.isRepository) {
+            String repoNodeId = "REPOSITORY:" + targetClass.className + "." + call.methodName;
+            if (!nodeIds.contains(repoNodeId)) {
+                GraphNodeDTO syntheticNode = new GraphNodeDTO("REPOSITORY", targetClass.className, call.methodName);
+                syntheticNode.metadata.put("synthetic", true);
+                syntheticNode.metadata.put("sourceFile", targetClass.sourceFile);
+                nodeIds.add(repoNodeId);
+                nodes.add(syntheticNode);
+
+                String entityName = targetClass.className
+                    .replaceAll("Repository$", "")
+                    .replaceAll("Repo$", "");
+                String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+                if (nodeIds.contains(entityNodeId)) {
+                    String op = detectPersistenceOp(call.methodName);
+                    if (isWriteOp(op)) {
+                        addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "WRITES_ENTITY", Map.of("operation", op));
+                    } else {
+                        addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "READS_ENTITY", Map.of("operation", op != null ? op : "read"));
+                    }
+                }
+            }
+            addEdge(edges, edgeKeys, fromId, repoNodeId, "CALLS", null);
+        } else {
+            String targetNodeType;
+            if (targetClass.isController) targetNodeType = "CONTROLLER";
+            else if (targetClass.isService) targetNodeType = "SERVICE";
+            else if (targetClass.isRepository) targetNodeType = "REPOSITORY";
+            else return;
+
+            String toId = targetNodeType + ":" + targetClass.className + "." + call.methodName;
+            if (nodeIds.contains(toId)) {
+                addEdge(edges, edgeKeys, fromId, toId, "CALLS", null);
+            }
+        }
+    }
+
+    private void handleSyntheticRepoCall(String fromId, MethodCallInfo call, String repoType,
+                                         List<GraphNodeDTO> nodes, List<GraphEdgeDTO> edges,
+                                         Set<String> nodeIds, Set<String> edgeKeys) {
+        String repoNodeId = "REPOSITORY:" + repoType + "." + call.methodName;
+        if (!nodeIds.contains(repoNodeId)) {
+            GraphNodeDTO syntheticNode = new GraphNodeDTO("REPOSITORY", repoType, call.methodName);
+            syntheticNode.metadata.put("synthetic", true);
+            nodeIds.add(repoNodeId);
+            nodes.add(syntheticNode);
+
+            String entityName = repoType.replaceAll("Repository$", "").replaceAll("Repo$", "");
+            String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+            if (nodeIds.contains(entityNodeId)) {
+                String op = detectPersistenceOp(call.methodName);
+                if (isWriteOp(op)) {
+                    addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "WRITES_ENTITY", Map.of("operation", op));
+                } else {
+                    addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "READS_ENTITY", Map.of("operation", op != null ? op : "read"));
+                }
+            }
+        }
+        addEdge(edges, edgeKeys, fromId, repoNodeId, "CALLS", null);
+    }
+
+    private void handleEntityMutations(String fromId, ClassInfo cls,
+                                       List<GraphEdgeDTO> edges, Set<String> nodeIds, Set<String> edgeKeys) {
+        Set<String> entityNames = new HashSet<>();
+
+        for (MethodInfo m : cls.methods) {
+            for (MethodCallInfo call : m.methodCalls) {
+                String targetType = resolveTargetType(call.targetVariable, cls);
+                ClassInfo targetClass = targetType != null ? classMap.get(targetType) : null;
+                if (targetClass != null && targetClass.isRepository) {
+                    String entityName = targetClass.className.replaceAll("Repository$", "").replaceAll("Repo$", "");
+                    entityNames.add(entityName);
+                }
+            }
+        }
+
+        for (String injectedType : cls.injectedFields.values()) {
+            if (injectedType.endsWith("Repository") || injectedType.endsWith("Repo")) {
+                String entityName = injectedType.replaceAll("Repository$", "").replaceAll("Repo$", "");
+                entityNames.add(entityName);
+            }
+        }
+
+        for (String entityName : entityNames) {
+            String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+            if (nodeIds.contains(entityNodeId)) {
+                addEdge(edges, edgeKeys, fromId, entityNodeId, "WRITES_ENTITY", Map.of("operation", "state_change"));
+            }
+        }
+    }
+
+    private String resolveTargetType(String varName, ClassInfo cls) {
+        if (varName == null) return null;
+        if ("this".equals(varName)) return cls.className;
+        return cls.injectedFields.get(varName);
+    }
+
+    private String detectPersistenceOp(String methodName) {
+        String lower = methodName.toLowerCase();
+        for (String s : PERSISTENCE_SAVE) {
+            if (lower.contains(s.toLowerCase())) return "save";
+        }
+        for (String d : PERSISTENCE_DELETE) {
+            if (lower.contains(d.toLowerCase())) return "delete";
+        }
+        for (String r : PERSISTENCE_READ) {
+            if (lower.contains(r.toLowerCase())) return "read";
+        }
+        if (lower.startsWith("find") || lower.startsWith("get") || lower.startsWith("search") ||
+            lower.startsWith("query") || lower.startsWith("list") || lower.startsWith("fetch") ||
+            lower.startsWith("exists") || lower.startsWith("count")) {
+            return "read";
+        }
+        return null;
+    }
+
+    private boolean isWriteOp(String op) {
+        return "save".equals(op) || "update".equals(op) || "delete".equals(op);
+    }
+
+    private void addEdge(List<GraphEdgeDTO> edges, Set<String> edgeKeys,
+                         String fromNode, String toNode, String relationType,
+                         Map<String, Object> metadata) {
+        String key = fromNode + "->" + toNode + ":" + relationType;
+        if (edgeKeys.add(key)) {
+            edges.add(new GraphEdgeDTO(fromNode, toNode, relationType, metadata));
+        }
+    }
+
+    static class ClassInfo {
+        String className;
+        String packageName;
+        String sourceFile;
+        boolean isInterface;
+        boolean isController;
+        boolean isService;
+        boolean isRepository;
+        boolean isEntity;
+        String basePath = "";
+        Map<String, String> injectedFields = new HashMap<>();
+        List<MethodInfo> methods = new ArrayList<>();
+        List<EntityField> entityFields = new ArrayList<>();
+    }
+
+    static class MethodInfo {
+        String name;
+        String returnType;
+        List<String> parameters = new ArrayList<>();
+        String httpMethod;
+        String httpPath;
+        List<MethodCallInfo> methodCalls = new ArrayList<>();
+        boolean hasEntityMutations;
+    }
+
+    static class MethodCallInfo {
+        String methodName;
+        String targetVariable;
+    }
+
+    static class EntityField {
+        String name;
+        String type;
+        boolean isId;
+    }
+}

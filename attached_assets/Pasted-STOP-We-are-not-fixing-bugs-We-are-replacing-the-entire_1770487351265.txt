@@ -1,0 +1,144 @@
+STOP.
+
+We are not fixing bugs.
+We are replacing the entire parsing foundation of this system.
+
+The current implementation uses regex-based parsing for:
+- Java backend
+- Vue templates
+- Angular templates
+- Indirect function tracing
+
+This is unacceptable for the purpose of this system.
+
+This system is NOT a text analyzer.
+This system MUST be a compiler-level structural code analyzer.
+
+You must refactor the analyzers to use REAL LANGUAGE PARSERS.
+
+This is a hard requirement.
+
+========================================================
+GOAL
+========================================================
+
+Transform this project into a true multi-language structural analyzer capable of producing a 100% reliable ApplicationGraph from real projects.
+
+The ApplicationGraph, EndpointImpact, and frontend-backend matching MUST remain exactly as they are.
+
+ONLY the analyzers must be replaced.
+
+========================================================
+BACKEND JAVA ANALYZER — COMPLETE REWRITE
+========================================================
+
+You MUST discard regex parsing completely.
+
+Create a new Java analyzer using:
+
+JavaParser + Symbol Solver
+https://javaparser.org/
+
+This analyzer must run inside a JVM process, not Node.
+
+Create a small Java service inside the project:
+
+/java-analyzer-engine
+
+This service must:
+
+- Parse all Java files using JavaParser
+- Resolve symbols (imports, inheritance, interfaces, generics)
+- Detect:
+    - Controllers (@RestController, @RequestMapping, @GetMapping, etc)
+    - Services
+    - Repositories (JpaRepository, CrudRepository, custom queries)
+    - Entities (@Entity)
+    - Method calls with full resolution (including inherited methods)
+    - Field injections (@Autowired, constructor injection)
+    - Method call chains across classes
+    - Entity reads/writes based on repository operations AND entity mutations (.setX)
+
+This Java service must output a JSON representation EXACTLY matching the expected ApplicationGraph nodes and edges.
+
+Node/TS part will call this Java service.
+
+========================================================
+VUE ANALYZER — COMPLETE REWRITE
+========================================================
+
+You MUST stop using regex to parse templates.
+
+Use:
+
+@vue/compiler-sfc
+@vue/compiler-dom
+
+You must:
+
+- Parse SFC into script + template AST
+- Walk the template AST to find:
+    - buttons
+    - links
+    - forms
+    - menu items
+    - event bindings (@click, @submit, etc)
+- Map handlers to script functions via AST, not text search
+
+========================================================
+ANGULAR ANALYZER — COMPLETE REWRITE
+========================================================
+
+Use:
+
+@angular/compiler
+
+You must:
+
+- Parse component templates into AST
+- Extract event bindings structurally
+- Map to component methods via TypeScript AST
+
+========================================================
+REACT / TS / JS
+========================================================
+
+Keep the existing TypeScript AST logic (already correct).
+
+Remove the regex fallback used in indirect call tracing.
+Everything must be resolved through AST and symbol references.
+
+========================================================
+CRITICAL RULES
+========================================================
+
+1) Regex is FORBIDDEN for structural parsing.
+2) No text search for functions, classes, templates, or calls.
+3) Every detection must come from AST nodes.
+4) The result must still populate the SAME ApplicationGraph model.
+5) EndpointImpact and matching logic must not be modified.
+
+========================================================
+EXPECTED PROJECT STRUCTURE
+========================================================
+
+/java-analyzer-engine (Java + Maven or Gradle)
+    Exposes REST endpoint /analyze
+    Returns ApplicationGraph JSON
+
+/server/analyzers
+    frontend-analyzer.ts (AST only)
+    backend-java-client.ts (calls Java engine)
+
+========================================================
+FINAL RESULT
+========================================================
+
+After this refactor, the system must be capable of analyzing REAL enterprise projects without false positives or missed elements.
+
+This is no longer a prototype.
+This is a compiler-grade code analyzer.
+
+Start the refactor now.
+Do not patch the existing code.
+Replace the analyzers completely.

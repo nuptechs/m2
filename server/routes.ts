@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { analyzeFrontend } from "./analyzers/frontend-analyzer";
-import { buildApplicationGraph, analyzeGraphEndpoints } from "./analyzers/java-analyzer";
+import { buildApplicationGraphAsync, analyzeGraphEndpoints } from "./analyzers/backend-java-client";
 import { interactionsToCatalogEntries } from "./analyzers/graph-connector";
 import { classifyEntries } from "./analyzers/semantic-engine";
 import { z } from "zod";
@@ -131,7 +131,7 @@ export async function registerRoutes(
           content: f.content,
         }));
 
-        const appGraph = buildApplicationGraph(fileData);
+        const appGraph = await buildApplicationGraphAsync(fileData);
         const endpointImpacts = analyzeGraphEndpoints(appGraph);
 
         const frontendInteractions = analyzeFrontend(fileData, appGraph);
