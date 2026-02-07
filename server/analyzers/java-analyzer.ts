@@ -609,8 +609,9 @@ export function buildApplicationGraph(
 
   for (const cls of allClasses) {
     if (cls.isEntity) {
+      const entityId = `ENTITY:${cls.className}`;
       graph.addNode(
-        new GraphNode("ENTITY", cls.className, null, {
+        new GraphNode(entityId, "ENTITY", cls.className, null, null, {
           tableName: cls.tableName,
           fields: cls.entityFields,
           sourceFile: cls.sourceFile,
@@ -620,8 +621,9 @@ export function buildApplicationGraph(
 
     if (cls.isRepository) {
       for (const method of cls.methods) {
+        const repoMethodId = `REPOSITORY:${cls.className}.${method.methodName}`;
         graph.addNode(
-          new GraphNode("REPOSITORY", cls.className, method.methodName, {
+          new GraphNode(repoMethodId, "REPOSITORY", cls.className, method.methodName, null, {
             sourceFile: cls.sourceFile,
             lineNumber: method.lineNumber,
           })
@@ -657,8 +659,9 @@ export function buildApplicationGraph(
 
     if (cls.isService) {
       for (const method of cls.methods) {
+        const serviceMethodId = `SERVICE:${cls.className}.${method.methodName}`;
         graph.addNode(
-          new GraphNode("SERVICE", cls.className, method.methodName, {
+          new GraphNode(serviceMethodId, "SERVICE", cls.className, method.methodName, null, {
             visibility: method.visibility,
             sourceFile: cls.sourceFile,
             lineNumber: method.lineNumber,
@@ -674,8 +677,9 @@ export function buildApplicationGraph(
           `${cls.basePath}${method.httpMapping.path}`.replace(/\/+/g, "/") ||
           cls.basePath ||
           "/";
+        const controllerMethodId = `CONTROLLER:${cls.className}.${method.methodName}`;
         graph.addNode(
-          new GraphNode("CONTROLLER", cls.className, method.methodName, {
+          new GraphNode(controllerMethodId, "CONTROLLER", cls.className, method.methodName, null, {
             httpMethod: method.httpMapping.method,
             path: method.httpMapping.path,
             fullPath,
@@ -705,8 +709,9 @@ export function buildApplicationGraph(
         if (targetClass && targetClass.isRepository) {
           const repoNodeId = `REPOSITORY:${targetClass.className}.${call.methodName}`;
           if (!graph.getNode(repoNodeId)) {
+            const synRepoId = `REPOSITORY:${targetClass.className}.${call.methodName}`;
             graph.addNode(
-              new GraphNode("REPOSITORY", targetClass.className, call.methodName, {
+              new GraphNode(synRepoId, "REPOSITORY", targetClass.className, call.methodName, null, {
                 sourceFile: targetClass.sourceFile,
                 synthetic: true,
               })
@@ -759,8 +764,9 @@ export function buildApplicationGraph(
           if (varType && (varType.endsWith("Repository") || varType.endsWith("Repo"))) {
             const repoNodeId = `REPOSITORY:${varType}.${call.methodName}`;
             if (!graph.getNode(repoNodeId)) {
+              const varRepoId = `REPOSITORY:${varType}.${call.methodName}`;
               graph.addNode(
-                new GraphNode("REPOSITORY", varType, call.methodName, { synthetic: true })
+                new GraphNode(varRepoId, "REPOSITORY", varType, call.methodName, null, { synthetic: true })
               );
               const entityName = varType.replace(/Repository$/, "").replace(/Repo$/, "");
               const entityNodeId = `ENTITY:${entityName}`;

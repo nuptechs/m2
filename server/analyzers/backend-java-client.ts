@@ -73,6 +73,7 @@ interface JavaEngineResult {
     type: string;
     className: string;
     methodName: string;
+    qualifiedSignature: string | null;
     metadata: Record<string, unknown>;
   }>;
   edges: Array<{
@@ -105,9 +106,11 @@ function reconstructGraph(result: JavaEngineResult): ApplicationGraph {
 
   for (const n of result.nodes) {
     const node = new GraphNode(
+      n.id,
       n.type as NodeType,
       n.className,
       n.methodName || null,
+      n.qualifiedSignature || null,
       n.metadata || {}
     );
     graph.addNode(node);

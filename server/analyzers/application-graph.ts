@@ -6,18 +6,22 @@ export class GraphNode {
   readonly type: NodeType;
   readonly className: string;
   readonly methodName: string | null;
+  readonly qualifiedSignature: string | null;
   readonly metadata: Record<string, unknown>;
 
   constructor(
+    id: string,
     type: NodeType,
     className: string,
     methodName: string | null,
+    qualifiedSignature: string | null,
     metadata: Record<string, unknown> = {}
   ) {
+    this.id = id;
     this.type = type;
     this.className = className;
     this.methodName = methodName;
-    this.id = methodName ? `${type}:${className}.${methodName}` : `${type}:${className}`;
+    this.qualifiedSignature = qualifiedSignature;
     this.metadata = metadata;
   }
 }
@@ -151,7 +155,7 @@ export class ApplicationGraph {
 }
 
 function nodeToJSON(n: GraphNode) {
-  return { id: n.id, type: n.type, className: n.className, methodName: n.methodName, metadata: n.metadata };
+  return { id: n.id, type: n.type, className: n.className, methodName: n.methodName, qualifiedSignature: n.qualifiedSignature, metadata: n.metadata };
 }
 
 function edgeToJSON(e: GraphEdge) {

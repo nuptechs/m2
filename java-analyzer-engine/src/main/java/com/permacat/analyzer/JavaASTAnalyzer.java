@@ -99,6 +99,7 @@ public class JavaASTAnalyzer {
             }
 
             resolveClassSymbols(compilationUnits);
+            resolveMethodSignatures(compilationUnits);
             resolveRepositoryEntitiesViaGenerics(compilationUnits);
 
         } catch (Exception e) {
@@ -127,6 +128,34 @@ public class JavaASTAnalyzer {
                     symbolClassMap.put(resolved, info);
                 } catch (Exception e) {
                     System.err.println("Could not resolve symbol for class: " + className + " - " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void resolveMethodSignatures(List<CompilationUnit> compilationUnits) {
+        for (CompilationUnit cu : compilationUnits) {
+            for (ClassOrInterfaceDeclaration cls : cu.findAll(ClassOrInterfaceDeclaration.class)) {
+                String className = cls.getNameAsString();
+                ClassInfo info = fqnIndex.values().stream()
+                    .filter(ci -> ci.className.equals(className))
+                    .findFirst().orElse(null);
+                if (info == null) continue;
+
+                for (MethodDeclaration methodDecl : cls.getMethods()) {
+                    String methodName = methodDecl.getNameAsString();
+                    MethodInfo mi = info.methods.stream()
+                        .filter(m -> m.name.equals(methodName) && m.resolvedQualifiedSignature == null)
+                        .findFirst().orElse(null);
+                    if (mi == null) continue;
+
+                    try {
+                        ResolvedMethodDeclaration resolved = methodDecl.resolve();
+                        mi.resolvedQualifiedSignature = resolved.getQualifiedSignature();
+                    } catch (Exception e) {
+                        System.err.println("[RESOLVE-FAIL] method declaration " + className + "." + methodName
+                            + ": " + e.getClass().getSimpleName() + " - " + e.getMessage());
+                    }
                 }
             }
         }
@@ -357,6 +386,7 @@ public class JavaASTAnalyzer {
                     mci.methodName = callExpr.getNameAsString();
                     mci.resolvedDeclaringType = declaringType;
                     mci.resolvedSignature = resolved.getQualifiedSignature();
+                    mci.resolvedMethodSignature = resolved.getSignature();
                     mci.resolvedReturnType = resolved.getReturnType().describe();
 
                     if (callExpr.getScope().isPresent()) {
@@ -450,15 +480,42 @@ public class JavaASTAnalyzer {
         return combined;
     }
 
+    private String resolvedEntityNodeId(ClassInfo cls) {
+        if (cls.resolvedSymbol != null) {
+            return "ENTITY:" + cls.resolvedSymbol.getQualifiedName();
+        }
+        return "ENTITY:" + cls.fqn;
+    }
+
+    private String resolvedClassNodeId(String nodeType, ClassInfo cls) {
+        if (cls.resolvedSymbol != null) {
+            return nodeType + ":" + cls.resolvedSymbol.getQualifiedName();
+        }
+        return nodeType + ":" + cls.fqn;
+    }
+
+    private String requalifySignature(String resolvedSignature, String targetQualifiedName) {
+        int parenIdx = resolvedSignature.indexOf('(');
+        if (parenIdx < 0) return targetQualifiedName + "." + resolvedSignature;
+        int dotBeforeParen = resolvedSignature.lastIndexOf('.', parenIdx);
+        if (dotBeforeParen < 0) return targetQualifiedName + "." + resolvedSignature;
+        String methodPart = resolvedSignature.substring(dotBeforeParen + 1);
+        return targetQualifiedName + "." + methodPart;
+    }
+
     private AnalysisResult buildGraph() {
         List<GraphNodeDTO> nodes = new ArrayList<>();
         List<GraphEdgeDTO> edges = new ArrayList<>();
         Set<String> nodeIds = new HashSet<>();
         Set<String> edgeKeys = new HashSet<>();
+        Map<String, String> signatureToNodeId = new HashMap<>();
 
         for (ClassInfo cls : fqnIndex.values()) {
             if (cls.isEntity) {
-                GraphNodeDTO entityNode = new GraphNodeDTO("ENTITY", cls.className, cls.className);
+                String entityQualifiedName = cls.resolvedSymbol != null
+                    ? cls.resolvedSymbol.getQualifiedName() : cls.fqn;
+                GraphNodeDTO entityNode = new GraphNodeDTO(
+                    "ENTITY", cls.className, cls.className, entityQualifiedName);
                 entityNode.metadata.put("sourceFile", cls.sourceFile);
                 entityNode.metadata.put("fields", cls.entityFields.stream()
                     .map(f -> f.name + ":" + f.type)
@@ -479,15 +536,18 @@ public class JavaASTAnalyzer {
             else continue;
 
             if (cls.isRepository) {
-                GraphNodeDTO repoNode = new GraphNodeDTO("REPOSITORY", cls.className, cls.className);
+                String repoQualifiedName = cls.resolvedSymbol != null
+                    ? cls.resolvedSymbol.getQualifiedName() : cls.fqn;
+                GraphNodeDTO repoNode = new GraphNodeDTO(
+                    "REPOSITORY", cls.className, cls.className, repoQualifiedName);
                 repoNode.metadata.put("sourceFile", cls.sourceFile);
                 if (nodeIds.add(repoNode.id)) {
                     nodes.add(repoNode);
                 }
 
-                String entityName = resolveEntityForRepository(cls);
-                if (entityName != null) {
-                    String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+                ClassInfo entityInfo = resolveEntityClassForRepository(cls);
+                if (entityInfo != null) {
+                    String entityNodeId = resolvedEntityNodeId(entityInfo);
                     if (nodeIds.contains(entityNodeId)) {
                         addEdge(edges, edgeKeys, repoNode.id, entityNodeId, "READS_ENTITY",
                             Map.of("operation", "read"));
@@ -497,6 +557,7 @@ public class JavaASTAnalyzer {
 
             for (MethodInfo method : cls.methods) {
                 if (cls.isController && method.httpMethod == null) continue;
+                if (method.resolvedQualifiedSignature == null) continue;
 
                 Map<String, Object> meta = new HashMap<>();
                 meta.put("sourceFile", cls.sourceFile);
@@ -507,9 +568,12 @@ public class JavaASTAnalyzer {
                 meta.put("returnType", method.returnType);
                 meta.put("parameters", method.parameters);
 
-                GraphNodeDTO node = new GraphNodeDTO(nodeType, cls.className, method.name, meta);
+                GraphNodeDTO node = new GraphNodeDTO(
+                    nodeType, cls.className, method.name,
+                    method.resolvedQualifiedSignature, meta);
                 if (nodeIds.add(node.id)) {
                     nodes.add(node);
+                    signatureToNodeId.put(method.resolvedQualifiedSignature, node.id);
                 }
             }
         }
@@ -525,8 +589,9 @@ public class JavaASTAnalyzer {
 
             for (MethodInfo method : cls.methods) {
                 if (cls.isController && method.httpMethod == null) continue;
+                if (method.resolvedQualifiedSignature == null) continue;
 
-                String fromId = nodeType + ":" + cls.className + "." + method.name;
+                String fromId = nodeType + ":" + method.resolvedQualifiedSignature;
                 if (!nodeIds.contains(fromId)) continue;
 
                 for (MethodCallInfo call : method.methodCalls) {
@@ -538,37 +603,46 @@ public class JavaASTAnalyzer {
                     if (targetClass == null) continue;
 
                     if (targetClass.isRepository) {
-                        String repoNodeId = "REPOSITORY:" + targetClass.className + "." + call.methodName;
-                        if (!nodeIds.contains(repoNodeId)) {
-                            GraphNodeDTO syntheticNode = new GraphNodeDTO("REPOSITORY", targetClass.className, call.methodName);
+                        String repoQualifiedName = targetClass.resolvedSymbol != null
+                            ? targetClass.resolvedSymbol.getQualifiedName() : targetClass.fqn;
+                        String requalified = requalifySignature(call.resolvedSignature, repoQualifiedName);
+                        String repoMethodNodeId = "REPOSITORY:" + requalified;
+
+                        if (!nodeIds.contains(repoMethodNodeId)) {
+                            GraphNodeDTO syntheticNode = new GraphNodeDTO(
+                                "REPOSITORY", targetClass.className, call.methodName, requalified);
                             syntheticNode.metadata.put("synthetic", true);
                             syntheticNode.metadata.put("sourceFile", targetClass.sourceFile);
                             syntheticNode.metadata.put("resolvedFrom", call.resolvedSignature);
-                            nodeIds.add(repoNodeId);
+                            nodeIds.add(repoMethodNodeId);
                             nodes.add(syntheticNode);
+                            signatureToNodeId.put(requalified, repoMethodNodeId);
 
-                            String entityName = resolveEntityForRepository(targetClass);
-                            if (entityName != null) {
-                                String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+                            ClassInfo entityInfo = resolveEntityClassForRepository(targetClass);
+                            if (entityInfo != null) {
+                                String entityNodeId = resolvedEntityNodeId(entityInfo);
                                 if (nodeIds.contains(entityNodeId)) {
                                     String op = detectPersistenceOp(call.methodName);
                                     if (isWriteOp(op)) {
-                                        addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "WRITES_ENTITY", Map.of("operation", op));
+                                        addEdge(edges, edgeKeys, repoMethodNodeId, entityNodeId, "WRITES_ENTITY", Map.of("operation", op));
                                     } else {
-                                        addEdge(edges, edgeKeys, repoNodeId, entityNodeId, "READS_ENTITY", Map.of("operation", op != null ? op : "read"));
+                                        addEdge(edges, edgeKeys, repoMethodNodeId, entityNodeId, "READS_ENTITY", Map.of("operation", op != null ? op : "read"));
                                     }
                                 }
                             }
                         }
-                        addEdge(edges, edgeKeys, fromId, repoNodeId, "CALLS", null);
+                        addEdge(edges, edgeKeys, fromId, repoMethodNodeId, "CALLS", null);
                     } else {
-                        String targetNodeType;
-                        if (targetClass.isController) targetNodeType = "CONTROLLER";
-                        else if (targetClass.isService) targetNodeType = "SERVICE";
-                        else continue;
+                        String targetQualifiedName = targetClass.resolvedSymbol != null
+                            ? targetClass.resolvedSymbol.getQualifiedName() : targetClass.fqn;
+                        String requalified = requalifySignature(call.resolvedSignature, targetQualifiedName);
+                        String toId = signatureToNodeId.get(requalified);
 
-                        String toId = targetNodeType + ":" + targetClass.className + "." + call.methodName;
-                        if (nodeIds.contains(toId)) {
+                        if (toId == null) {
+                            toId = signatureToNodeId.get(call.resolvedSignature);
+                        }
+
+                        if (toId != null && nodeIds.contains(toId)) {
                             addEdge(edges, edgeKeys, fromId, toId, "CALLS", null);
                         }
                     }
@@ -583,16 +657,18 @@ public class JavaASTAnalyzer {
         return new AnalysisResult(nodes, edges);
     }
 
-    private String resolveEntityForRepository(ClassInfo repoInfo) {
+    private ClassInfo resolveEntityClassForRepository(ClassInfo repoInfo) {
         if (repoInfo.resolvedEntityClassName != null) {
-            return repoInfo.resolvedEntityClassName;
+            return fqnIndex.values().stream()
+                .filter(ci -> ci.isEntity && ci.className.equals(repoInfo.resolvedEntityClassName))
+                .findFirst().orElse(null);
         }
         return null;
     }
 
     private void handleEntityMutations(String fromId, ClassInfo cls,
                                        List<GraphEdgeDTO> edges, Set<String> nodeIds, Set<String> edgeKeys) {
-        Set<String> entityNames = new HashSet<>();
+        Set<String> entityNodeIds = new HashSet<>();
 
         for (MethodInfo m : cls.methods) {
             for (MethodCallInfo call : m.methodCalls) {
@@ -601,16 +677,15 @@ public class JavaASTAnalyzer {
                     targetClass = symbolClassMap.get(call.resolvedScopeType);
                 }
                 if (targetClass != null && targetClass.isRepository) {
-                    String entityName = resolveEntityForRepository(targetClass);
-                    if (entityName != null) {
-                        entityNames.add(entityName);
+                    ClassInfo entityInfo = resolveEntityClassForRepository(targetClass);
+                    if (entityInfo != null) {
+                        entityNodeIds.add(resolvedEntityNodeId(entityInfo));
                     }
                 }
             }
         }
 
-        for (String entityName : entityNames) {
-            String entityNodeId = "ENTITY:" + entityName + "." + entityName;
+        for (String entityNodeId : entityNodeIds) {
             if (nodeIds.contains(entityNodeId)) {
                 addEdge(edges, edgeKeys, fromId, entityNodeId, "WRITES_ENTITY", Map.of("operation", "state_change"));
             }
@@ -673,6 +748,7 @@ public class JavaASTAnalyzer {
         List<String> parameters = new ArrayList<>();
         String httpMethod;
         String httpPath;
+        String resolvedQualifiedSignature;
         List<MethodCallInfo> methodCalls = new ArrayList<>();
         boolean hasEntityMutations;
     }
@@ -682,6 +758,7 @@ public class JavaASTAnalyzer {
         ResolvedReferenceTypeDeclaration resolvedDeclaringType;
         ResolvedReferenceTypeDeclaration resolvedScopeType;
         String resolvedSignature;
+        String resolvedMethodSignature;
         String resolvedReturnType;
     }
 

@@ -93,12 +93,19 @@ shared/
 
 ## Application Graph Model
 The backend is represented as a navigable in-memory graph:
-- **GraphNode** (id, type: CONTROLLER|SERVICE|REPOSITORY|ENTITY, className, methodName, metadata)
-- **GraphEdge** (fromNode, toNode, relationType: CALLS|WRITES_ENTITY|READS_ENTITY, metadata)
+- **GraphNode** (id, type: CONTROLLER|SERVICE|REPOSITORY|ENTITY, className, methodName, qualifiedSignature, metadata)
+- **Node IDs** are built from resolved symbols:
+  - Method nodes: `type + ":" + ResolvedMethodDeclaration.getQualifiedSignature()` (e.g., `CONTROLLER:com.example.controller.UserController.getAll()`)
+  - Entity nodes: `ENTITY: + ResolvedReferenceTypeDeclaration.getQualifiedName()` (e.g., `ENTITY:com.example.model.User`)
+  - Repository class nodes: `REPOSITORY: + ResolvedReferenceTypeDeclaration.getQualifiedName()`
+  - Synthetic repo method nodes: scope type qualified name + method signature (requalified from declaring type)
+- **GraphEdge** (fromNode, toNode, relationType: CALLS|WRITES_ENTITY|READS_ENTITY, metadata) — edges connect via qualified signature IDs
 - **ApplicationGraph** class with addNode/addEdge, getNodesByType, reachableFrom(nodeId), toJSON
+- **GraphNode.id comes from Java engine** — Node.js GraphNode accepts id parameter directly (no local construction)
 - **buildApplicationGraphAsync(files)** calls Java engine then reconstructs graph from JSON
 - **analyzeGraphEndpoints(graph)** traverses the graph per controller endpoint to produce EndpointImpact
 - **EndpointImpact** contains endpoint, involvedNodes, entitiesTouched, callDepth, fullCallChain, persistenceOperations
+- **resolveMethodSignatures()** — separate pass after resolveClassSymbols() that resolves each MethodDeclaration to get its qualified signature; methods that fail resolution are excluded from the graph
 
 ## Data Flow
 1. User uploads source files → stored in `source_files` table
