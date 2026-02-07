@@ -515,7 +515,7 @@ public class JavaASTAnalyzer {
                 String entityQualifiedName = cls.resolvedSymbol != null
                     ? cls.resolvedSymbol.getQualifiedName() : cls.fqn;
                 GraphNodeDTO entityNode = new GraphNodeDTO(
-                    "ENTITY", cls.className, cls.className, entityQualifiedName);
+                    "ENTITY", cls.className, null, entityQualifiedName);
                 entityNode.metadata.put("sourceFile", cls.sourceFile);
                 entityNode.metadata.put("fields", cls.entityFields.stream()
                     .map(f -> f.name + ":" + f.type)
@@ -539,7 +539,7 @@ public class JavaASTAnalyzer {
                 String repoQualifiedName = cls.resolvedSymbol != null
                     ? cls.resolvedSymbol.getQualifiedName() : cls.fqn;
                 GraphNodeDTO repoNode = new GraphNodeDTO(
-                    "REPOSITORY", cls.className, cls.className, repoQualifiedName);
+                    "REPOSITORY", cls.className, null, repoQualifiedName);
                 repoNode.metadata.put("sourceFile", cls.sourceFile);
                 if (nodeIds.add(repoNode.id)) {
                     nodes.add(repoNode);
