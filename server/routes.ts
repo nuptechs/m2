@@ -1,6 +1,9 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { storage } from "./storage";
 import { analyzeFrontend } from "./analyzers/frontend-analyzer";
 import { buildApplicationGraph, analyzeGraphEndpoints } from "./analyzers/backend-java-client";
@@ -10,7 +13,13 @@ import { extractAndScanZip, getFileType } from "./analyzers/repository-scanner";
 import { z } from "zod";
 
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (_req, file, cb) => {
+      const uniqueName = `permacat-upload-${Date.now()}-${Math.random().toString(36).slice(2)}${path.extname(file.originalname)}`;
+      cb(null, uniqueName);
+    },
+  }),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 },
 });
 
@@ -292,6 +301,18 @@ export async function registerRoutes(
       }, 15000);
     }
 
+    let tempFilePath: string | null = null;
+    const cleanupTempFile = () => {
+      try {
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+          fs.unlinkSync(tempFilePath);
+          console.log(`[upload] Cleaned up temp file: ${tempFilePath}`);
+        }
+      } catch (e) {
+        console.error(`[upload] Failed to clean up temp file ${tempFilePath}:`, e);
+      }
+    };
+
     try {
       const file = req.file;
       if (!file) {
@@ -304,7 +325,8 @@ export async function registerRoutes(
       }
 
       const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
-      console.log(`[upload] Received file "${file.originalname}" — ${fileSizeMB} MB (${file.size} bytes)`);
+      tempFilePath = file.path;
+      console.log(`[upload] Received file "${file.originalname}" — ${fileSizeMB} MB (${file.size} bytes) — stored at ${tempFilePath}`);
       sendProgress("upload", `Received ${file.originalname} (${fileSizeMB} MB)`);
       logMemory("after-receive");
 
@@ -313,7 +335,7 @@ export async function registerRoutes(
 
       sendProgress("scan", "Extracting and scanning ZIP for source files...");
       const scanStart = Date.now();
-      const scannedFiles = extractAndScanZip(file.buffer);
+      const scannedFiles = extractAndScanZip(tempFilePath);
       const scanElapsed = ((Date.now() - scanStart) / 1000).toFixed(1);
       logMemory("after-scan");
 
@@ -466,6 +488,8 @@ export async function registerRoutes(
         };
 
         if (heartbeatInterval) clearInterval(heartbeatInterval);
+        cleanupTempFile();
+
         if (useSSE) {
           res.write(`data: ${JSON.stringify({ type: "complete", result })}\n\n`);
           res.end();
@@ -485,6 +509,7 @@ export async function registerRoutes(
       }
     } catch (error) {
       if (heartbeatInterval) clearInterval(heartbeatInterval);
+      cleanupTempFile();
       const elapsed = ((Date.now() - uploadStartTime) / 1000).toFixed(1);
       const msg = error instanceof Error ? error.message : "Failed to process ZIP";
       console.error(`[upload] ERROR after ${elapsed}s: ${msg}`, error instanceof Error ? error.stack : "");

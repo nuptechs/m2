@@ -135,22 +135,27 @@ The backend is represented as a navigable in-memory graph:
 
 ## Repository Scanner Module
 - **File**: `server/analyzers/repository-scanner.ts`
-- **Function**: `extractAndScanZip(zipBuffer: Buffer)` → `ScannedFile[]`
+- **Function**: `extractAndScanZip(zipPathOrBuffer: string | Buffer)` → `ScannedFile[]`
 - **Supported extensions**: .java, .ts, .tsx, .js, .jsx, .vue, .py, .cs
 - **Ignored directories**: node_modules, .git, dist, build, target, .idea, .vscode, .gradle, __pycache__, etc.
 - **Max file size**: 512 KB per file
 - **ZIP root stripping**: Automatically strips the top-level folder from ZIP paths
-- Uses `adm-zip` for ZIP extraction, no filesystem I/O needed (in-memory processing)
+- Uses `adm-zip` for ZIP extraction; accepts file path (disk) or Buffer (memory)
+- **Disk-based upload**: multer writes ZIP to /tmp via diskStorage, scanner reads from disk path — avoids loading entire ZIP into Node.js heap (critical for 1GB+ ZIPs)
+- Temp files cleaned up after processing (success and error paths)
 
 ## Upload & Analysis Timeouts
 - HTTP server: 20-minute timeout (requestTimeout, headersTimeout, keepAliveTimeout, timeout)
+- Multer: 2GB max file size, diskStorage to /tmp (avoids OOM for large uploads)
 - Java engine fetch: 20-minute abort controller timeout
 - Frontend fetch: 20-minute abort controller timeout
 - JVM heap: -Xmx2g -Xms512m for large projects
+- Node.js heap: 4GB (--max-old-space-size=4096 via NODE_OPTIONS)
 - SSE streaming: ZIP upload uses Server-Sent Events to stream progress in real-time
   - Heartbeat every 15s prevents proxy/LB idle disconnects
   - Events: `progress` (step + detail), `complete` (result), `error` (message)
   - Frontend reads via ReadableStream and shows live progress log
+- Diagnostic logging: memory usage at 8 checkpoints, timestamps per phase, file save progress every 100 files
 
 ## System Dependencies
 - Java JDK 17 (for JavaParser-based analyzer engine)

@@ -1,6 +1,7 @@
 // @ts-ignore - adm-zip types
 import AdmZip from "adm-zip";
 import path from "path";
+import fs from "fs";
 
 const SUPPORTED_EXTENSIONS = new Set([
   ".java", ".ts", ".tsx", ".js", ".jsx", ".vue", ".py", ".cs",
@@ -19,10 +20,16 @@ interface ScannedFile {
   content: string;
 }
 
-export function extractAndScanZip(zipBuffer: Buffer): ScannedFile[] {
-  console.log(`[scanner] Starting ZIP extraction — buffer size: ${(zipBuffer.length / (1024 * 1024)).toFixed(1)} MB`);
+export function extractAndScanZip(zipPathOrBuffer: string | Buffer): ScannedFile[] {
+  const isFilePath = typeof zipPathOrBuffer === "string";
+  if (isFilePath) {
+    const fileSizeMB = (fs.statSync(zipPathOrBuffer).size / (1024 * 1024)).toFixed(1);
+    console.log(`[scanner] Starting ZIP extraction from disk — file: ${zipPathOrBuffer} (${fileSizeMB} MB)`);
+  } else {
+    console.log(`[scanner] Starting ZIP extraction from memory — buffer size: ${(zipPathOrBuffer.length / (1024 * 1024)).toFixed(1)} MB`);
+  }
   const parseStart = Date.now();
-  const zip = new AdmZip(zipBuffer);
+  const zip = new AdmZip(zipPathOrBuffer);
   const entries = zip.getEntries();
   console.log(`[scanner] ZIP parsed in ${((Date.now() - parseStart) / 1000).toFixed(1)}s — ${entries.length} total entries`);
 
