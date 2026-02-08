@@ -219,7 +219,7 @@ export default function UploadPage() {
 
       let res: Response;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+      const timeoutId = setTimeout(() => controller.abort(), 15 * 60 * 1000);
       try {
         res = await fetch("/api/projects/upload-zip", {
           method: "POST",
@@ -229,7 +229,7 @@ export default function UploadPage() {
       } catch (networkError: any) {
         clearTimeout(timeoutId);
         if (networkError.name === "AbortError") {
-          throw new Error("The analysis timed out after 5 minutes. Your project may be very large — try uploading fewer files or splitting into smaller ZIPs.");
+          throw new Error("The analysis timed out after 15 minutes. Your project may be very large — try uploading fewer files or splitting into smaller ZIPs.");
         }
         throw new Error("Network error: could not reach the server. Please check your connection and try again.");
       }
