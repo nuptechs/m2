@@ -122,7 +122,7 @@ async function callJavaEngine(
   console.log(`[java-client] JSON payload: ${jsonSizeMB} MB — serialized in ${Date.now() - serializeStart}ms`);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20 * 60 * 1000);
+  const timeout = setTimeout(() => controller.abort(), 25 * 60 * 1000);
 
   const sendStart = Date.now();
   console.log(`[java-client] Sending POST /analyze (${jsonSizeMB} MB payload)...`);
@@ -138,7 +138,7 @@ async function callJavaEngine(
     clearTimeout(timeout);
     const elapsed = ((Date.now() - sendStart) / 1000).toFixed(1);
     if (err.name === "AbortError") {
-      throw new Error(`Java engine analysis timed out after ${elapsed}s (20 min limit). The project may be too large for a single analysis pass.`);
+      throw new Error(`Java engine analysis timed out after ${elapsed}s (25 min limit). The project may be too large for a single analysis pass.`);
     }
     console.error(`[java-client] Fetch failed after ${elapsed}s: ${err.message}`);
     throw err;

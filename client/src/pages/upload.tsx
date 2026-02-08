@@ -220,7 +220,7 @@ export default function UploadPage() {
       if (description) formData.append("description", description);
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20 * 60 * 1000);
+      const timeoutId = setTimeout(() => controller.abort(), 25 * 60 * 1000);
 
       setProgressMessages(prev => [...prev, `upload: Uploading ${(zipFile.size / (1024 * 1024)).toFixed(1)} MB ZIP file...`]);
 
@@ -235,7 +235,7 @@ export default function UploadPage() {
       } catch (networkError: any) {
         clearTimeout(timeoutId);
         if (networkError.name === "AbortError") {
-          throw new Error("The analysis timed out after 20 minutes. Your project may be very large — try uploading fewer files or splitting into smaller ZIPs.");
+          throw new Error("The analysis timed out after 25 minutes. Your project may be very large — try uploading fewer files or splitting into smaller ZIPs.");
         }
         throw new Error(`Network error: could not reach the server (${networkError.message}). For very large files, the upload may have been interrupted.`);
       }

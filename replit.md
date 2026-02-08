@@ -145,10 +145,10 @@ The backend is represented as a navigable in-memory graph:
 - Temp files cleaned up after processing (success and error paths)
 
 ## Upload & Analysis Timeouts
-- HTTP server: 20-minute timeout (requestTimeout, headersTimeout, keepAliveTimeout, timeout)
+- HTTP server: 25-minute timeout (requestTimeout, headersTimeout, keepAliveTimeout, timeout)
 - Multer: 2GB max file size, diskStorage to /tmp (avoids OOM for large uploads)
-- Java engine fetch: 20-minute abort controller timeout
-- Frontend fetch: 20-minute abort controller timeout
+- Java engine fetch: 25-minute abort controller timeout
+- Frontend fetch: 25-minute abort controller timeout
 - JVM heap: -Xmx2g -Xms512m for large projects
 - Node.js heap: 4GB (--max-old-space-size=4096 via NODE_OPTIONS)
 - SSE streaming: ZIP upload uses Server-Sent Events to stream progress in real-time
