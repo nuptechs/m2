@@ -226,15 +226,27 @@ export async function registerRoutes(
     try {
       const file = req.file;
       if (!file) {
+        console.error("ZIP upload: No file received in request");
         return res.status(400).json({ message: "No ZIP file uploaded" });
       }
+
+      console.log(`ZIP upload: Received file "${file.originalname}" (${(file.size / 1024).toFixed(1)} KB)`);
 
       const projectName = req.body.name || "Uploaded Repository";
       const projectDescription = req.body.description || null;
 
       const scannedFiles = extractAndScanZip(file.buffer);
+      console.log(`ZIP upload: Scanned ${scannedFiles.length} supported files from ZIP`);
+      if (scannedFiles.length > 0) {
+        const exts = new Map<string, number>();
+        for (const f of scannedFiles) {
+          const ext = f.filePath.split(".").pop() || "?";
+          exts.set(ext, (exts.get(ext) || 0) + 1);
+        }
+        console.log(`ZIP upload: File types: ${Array.from(exts.entries()).map(([e, c]) => `${e}:${c}`).join(", ")}`);
+      }
       if (scannedFiles.length === 0) {
-        return res.status(400).json({ message: "No supported source files found in the ZIP" });
+        return res.status(400).json({ message: "No supported source files found in the ZIP. Supported extensions: .java, .ts, .tsx, .js, .jsx, .vue, .py, .cs" });
       }
 
       const project = await storage.createProject({

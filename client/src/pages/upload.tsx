@@ -215,12 +215,17 @@ export default function UploadPage() {
       formData.append("name", projectName);
       if (description) formData.append("description", description);
 
-      const res = await fetch("/api/projects/upload-zip", {
-        method: "POST",
-        body: formData,
-      });
+      let res: Response;
+      try {
+        res = await fetch("/api/projects/upload-zip", {
+          method: "POST",
+          body: formData,
+        });
+      } catch (networkError) {
+        throw new Error("Network error: could not reach the server. Please check your connection and try again.");
+      }
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ message: "Upload failed" }));
+        const err = await res.json().catch(() => ({ message: `Server error (${res.status}). Please try again.` }));
         throw new Error(err.message);
       }
       return res.json();
