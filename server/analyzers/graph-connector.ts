@@ -198,8 +198,10 @@ function matchByOperationName(
       }
     }
 
-    if (nodeScore < 60) {
-      const classTokens = tokenize(node.className.replace(/Controller$/i, ""));
+    if (nodeScore < 80) {
+      const cleanedClass = node.className
+        .replace(/(Controller|WsV\d+|Ws)$/i, "");
+      const classTokens = tokenize(cleanedClass);
       if (classTokens.length > 0) {
         const classSet = new Set(classTokens);
         let classIntersection = 0;
@@ -207,8 +209,14 @@ function matchByOperationName(
           if (classSet.has(t)) classIntersection++;
         });
         if (classIntersection > 0) {
-          const union = new Set(Array.from(opTokenSet).concat(classTokens)).size;
-          nodeScore = Math.max(nodeScore, (classIntersection / union) * 50);
+          if (classIntersection === opTokenSet.size && classIntersection === classSet.size) {
+            nodeScore = Math.max(nodeScore, 95);
+          } else if (classIntersection === opTokenSet.size || classIntersection === classSet.size) {
+            nodeScore = Math.max(nodeScore, 75);
+          } else {
+            const union = new Set(Array.from(opTokenSet).concat(classTokens)).size;
+            nodeScore = Math.max(nodeScore, (classIntersection / union) * 60);
+          }
         }
       }
     }
