@@ -50,7 +50,31 @@ The system constructs an in-memory Application Graph model to represent the back
   - Result: every function that transitively leads to an HTTP call gets the resolved URLs
 - **Lookup** (`lookupGlobalCallGraph`): Given handler name + file path, tries qualified key lookup, then import-resolved lookup
 - **Integration**: Built after HttpServiceMap in `analyzeFrontend`, passed to Vue/React/Angular file analyzers via `resolveBindingsViaNodes`
-- **Resolution order**: (1) `ScriptSymbolTable.traceHttpCalls` → (2) `resolveExternalCallsToHttpCalls` → (3) `lookupGlobalCallGraph`
+- **Resolution order**: (1) `ScriptSymbolTable.traceHttpCalls` → (2) `resolveExternalCallsToHttpCalls` → (3) `lookupGlobalCallGraph` → (4) `lookupEventGraph`
+
+### Component Event Graph (Fourth-Tier Resolution)
+- **Purpose**: Propagates HTTP resolution through component event boundaries ($emit in Vue, callback props in React, @Output in Angular). When a child component handler emits an event that is listened to by a parent handler which resolves to HTTP, the child handler inherits that HTTP mapping.
+- **Data structures**:
+  - `ComponentEventGraph`: `{ emitters, listeners, componentRegistry }`
+  - `emitters`: `Map<filePath, ComponentEmitEntry[]>` where entry = `{ eventName, emitterFunction }`
+  - `listeners`: `Map<parentFilePath, EventListenerEntry[]>` where entry = `{ childTag, childFilePath, eventName, parentHandler }`
+  - `componentRegistry`: `Map<tagName, filePath>` mapping PascalCase + kebab-case tag names to file paths
+- **Component Registry** (`buildComponentRegistry`):
+  - Registers all source files by filename-derived PascalCase, kebab-case, and base name
+  - Scans import declarations in Vue/React/Angular files to map imported component names to resolved file paths
+  - Uses `normalizeModulePath` (now supports `.vue` extensions) for cross-file resolution
+- **Emit detection** per framework:
+  - Vue: `this.$emit('event')`, `emit('event')` (Composition API), `context.emit('event')` — tracked with enclosing function name
+  - React: `props.onEventName()` or destructured `onEventName()` callback invocations
+  - Angular: `@Output() eventName = new EventEmitter()` + `this.eventName.emit()` patterns
+- **Listener detection** in parent templates:
+  - Vue: `<ChildComponent @eventName="parentHandler">` — detects custom component tags via `isCustomComponentTag`
+  - React: `<ChildComponent onEventName={parentHandler}>` — capitalized JSX tags with `on*` props
+  - Angular: `<child-component (eventName)="parentHandler()">` — custom elements with outputs
+- **Event name normalization** (`normalizeEventName`): strips `on` prefix, removes dashes/underscores, lowercases for cross-framework matching
+- **Resolution** (`lookupEventGraph`): finds emitted events for handler → scans all parent listeners for matching events → resolves parent handler via full 3-tier pipeline (local → cross-file → global call graph)
+- **Integration**: Built as pre-pass in `analyzeFrontend` alongside serviceMap and globalCallGraph, passed through to `resolveBindingsViaNodes` → `resolveHandlerHttpCalls`
+- **Validated on easynup**: endpoints 972→1014 (+42), controller matches 657→683 (+26), {base} URLs 306→317 (+11)
 
 ## External Dependencies
 - PostgreSQL
