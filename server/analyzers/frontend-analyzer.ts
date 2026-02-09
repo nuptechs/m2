@@ -120,9 +120,10 @@ class ImportedHttpClients {
   isHttpExpression(expressionText: string): boolean {
     const lower = expressionText.toLowerCase();
     if (this.httpIdentifiers.has(expressionText)) return true;
-    for (const id of this.httpIdentifiers) {
-      if (lower === id.toLowerCase()) return true;
-      if (lower.endsWith("." + id.toLowerCase())) return true;
+    const idArray = Array.from(this.httpIdentifiers);
+    for (let i = 0; i < idArray.length; i++) {
+      if (lower === idArray[i].toLowerCase()) return true;
+      if (lower.endsWith("." + idArray[i].toLowerCase())) return true;
     }
     if (lower === "this.http" || lower === "this.$http" || lower === "this.httpclient") return true;
     return false;
@@ -326,6 +327,10 @@ class ScriptSymbolTable {
     return this.nameIndex.get(handlerName) || null;
   }
 
+  getDeclaration(node: ts.Node): SymbolDeclaration | undefined {
+    return this.nodeMap.get(node);
+  }
+
   traceHttpCalls(startNode: ts.Node): HttpCall[] {
     const visited = new Set<ts.Node>();
     const results: HttpCall[] = [];
@@ -391,6 +396,670 @@ class ScriptSymbolTable {
     }
     return null;
   }
+}
+
+interface ExternalCall {
+  importedName: string;
+  methodName: string | null;
+  callerFunction: string;
+}
+
+interface ServiceMethodEntry {
+  httpCalls: HttpCall[];
+}
+
+interface FileServiceEntry {
+  methods: Map<string, ServiceMethodEntry>;
+  directFunctions: Map<string, HttpCall[]>;
+}
+
+type HttpServiceMap = Map<string, FileServiceEntry>;
+
+interface ImportBinding {
+  sourcePath: string;
+  originalName: string;
+  isDefault: boolean;
+}
+
+function normalizeModulePath(importerPath: string, moduleSpecifier: string, allFilePaths: string[]): string | null {
+  if (moduleSpecifier.startsWith(".")) {
+    const importerDir = importerPath.substring(0, importerPath.lastIndexOf("/"));
+    const parts = importerDir.split("/");
+    const specParts = moduleSpecifier.split("/");
+    const resolved: string[] = [...parts];
+    for (const seg of specParts) {
+      if (seg === ".") continue;
+      if (seg === "..") { resolved.pop(); continue; }
+      resolved.push(seg);
+    }
+    const base = resolved.join("/");
+    const extensions = [".ts", ".js", ".tsx", ".jsx", "/index.ts", "/index.js"];
+    for (const ext of extensions) {
+      const candidate = base + ext;
+      if (allFilePaths.indexOf(candidate) >= 0) return candidate;
+    }
+    if (allFilePaths.indexOf(base) >= 0) return base;
+    return null;
+  }
+
+  if (moduleSpecifier.startsWith("@/") || moduleSpecifier.startsWith("~/")) {
+    const relative = moduleSpecifier.substring(2);
+    const prefixes = ["frontend/src/", "src/", "app/", ""];
+    const extensions = ["", ".ts", ".js", ".tsx", ".jsx", "/index.ts", "/index.js"];
+    for (const prefix of prefixes) {
+      for (const ext of extensions) {
+        const candidate = prefix + relative + ext;
+        if (allFilePaths.indexOf(candidate) >= 0) return candidate;
+      }
+    }
+    return null;
+  }
+
+  if (!moduleSpecifier.startsWith(".") && !moduleSpecifier.startsWith("/")) {
+    return null;
+  }
+
+  return null;
+}
+
+function extractExports(sourceFile: ts.SourceFile): { exportedNames: Set<string>; classInstances: Map<string, string>; defaultExportName: string | null } {
+  const exportedNames = new Set<string>();
+  const classInstances = new Map<string, string>();
+  let defaultExportName: string | null = null;
+
+  const visit = (node: ts.Node) => {
+    const mods = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+    const hasExport = mods?.some(m => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+    const hasDefault = mods?.some(m => m.kind === ts.SyntaxKind.DefaultKeyword) ?? false;
+
+    if (hasExport && ts.isFunctionDeclaration(node) && node.name) {
+      exportedNames.add(node.name.text);
+      if (hasDefault) defaultExportName = node.name.text;
+    }
+
+    if (hasExport && ts.isClassDeclaration(node) && node.name) {
+      exportedNames.add(node.name.text);
+      if (hasDefault) defaultExportName = node.name.text;
+    }
+
+    if (hasExport && ts.isVariableStatement(node)) {
+      for (const decl of node.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name)) {
+          const varName = decl.name.text;
+          exportedNames.add(varName);
+          if (hasDefault) defaultExportName = varName;
+
+          if (decl.initializer && ts.isNewExpression(decl.initializer)) {
+            const ctorExpr = decl.initializer.expression;
+            if (ts.isIdentifier(ctorExpr)) {
+              classInstances.set(varName, ctorExpr.text);
+            }
+          }
+        }
+      }
+    }
+
+    if (ts.isExportAssignment(node)) {
+      if (ts.isIdentifier(node.expression)) {
+        defaultExportName = node.expression.text;
+        exportedNames.add(node.expression.text);
+      } else if (ts.isNewExpression(node.expression) && ts.isIdentifier(node.expression.expression)) {
+        defaultExportName = "__default__";
+        classInstances.set("__default__", node.expression.expression.text);
+      }
+    }
+
+    if (ts.isExportDeclaration(node) && node.exportClause && ts.isNamedExports(node.exportClause)) {
+      for (const spec of node.exportClause.elements) {
+        exportedNames.add(spec.name.text);
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  return { exportedNames, classInstances, defaultExportName };
+}
+
+function extractClassMethods(sourceFile: ts.SourceFile): Map<string, Map<string, HttpCall[]>> {
+  const classMethodMap = new Map<string, Map<string, HttpCall[]>>();
+
+  const httpClients = ImportedHttpClients.build(sourceFile);
+
+  const visit = (node: ts.Node) => {
+    if (ts.isClassDeclaration(node) && node.name) {
+      const className = node.name.text;
+      const methods = new Map<string, HttpCall[]>();
+
+      for (const member of node.members) {
+        if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name) && member.body) {
+          const methodName = member.name.text;
+          const calls: HttpCall[] = [];
+          walkForHttpCalls(member.body, sourceFile, httpClients, methodName, calls);
+          if (calls.length > 0) {
+            methods.set(methodName, calls);
+          }
+        }
+      }
+
+      if (methods.size > 0) {
+        classMethodMap.set(className, methods);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  return classMethodMap;
+}
+
+function buildLocalVarMap(body: ts.Node): Map<string, ts.Expression> {
+  const varMap = new Map<string, ts.Expression>();
+  const visit = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      varMap.set(node.name.text, node.initializer);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return varMap;
+}
+
+function resolveUrlFromExpression(expr: ts.Expression, varMap: Map<string, ts.Expression>, depth: number = 0): string | null {
+  if (depth > 5) return null;
+
+  if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) {
+    return expr.text;
+  }
+
+  if (ts.isTemplateExpression(expr)) {
+    let result = expr.head.text;
+    for (const span of expr.templateSpans) {
+      const resolved = resolveUrlFromExpression(span.expression as ts.Expression, varMap, depth + 1);
+      result += (resolved || "{param}") + span.literal.text;
+    }
+    return result;
+  }
+
+  if (ts.isIdentifier(expr)) {
+    const init = varMap.get(expr.text);
+    if (init) return resolveUrlFromExpression(init, varMap, depth + 1);
+  }
+
+  if (ts.isAwaitExpression(expr) && expr.expression) {
+    return resolveUrlFromExpression(expr.expression as ts.Expression, varMap, depth + 1);
+  }
+
+  if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = resolveUrlFromExpression(expr.left, varMap, depth + 1);
+    const right = resolveUrlFromExpression(expr.right, varMap, depth + 1);
+    if (left || right) return (left || "{param}") + (right || "{param}");
+  }
+
+  if (ts.isCallExpression(expr)) {
+    const fnExpr = expr.expression;
+    if (ts.isPropertyAccessExpression(fnExpr)) {
+      const methodName = fnExpr.name.text;
+      if (methodName === "buildEndpoint" || methodName === "buildUrl" || methodName === "getUrl" || methodName === "getEndpoint") {
+        const parts: string[] = [];
+        for (const arg of expr.arguments) {
+          if (ts.isStringLiteral(arg)) parts.push(arg.text);
+        }
+        if (parts.length > 0) return "{base}/" + parts.join("/");
+      }
+    }
+  }
+
+  return null;
+}
+
+function walkForHttpCalls(body: ts.Node, sourceFile: ts.SourceFile, httpClients: ImportedHttpClients, callerName: string, results: HttpCall[]): void {
+  const varMap = buildLocalVarMap(body);
+
+  const walk = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const httpCall = extractHttpCallFromExpression(node, sourceFile, httpClients, callerName, varMap);
+      if (httpCall) {
+        results.push(httpCall);
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(body);
+}
+
+function extractHttpCallFromExpression(node: ts.CallExpression, sourceFile: ts.SourceFile, httpClients: ImportedHttpClients, callerName: string, varMap?: Map<string, ts.Expression>): HttpCall | null {
+  const expr = node.expression;
+
+  if (ts.isPropertyAccessExpression(expr)) {
+    const methodName = expr.name.text.toLowerCase();
+    const httpMethods = ["get", "post", "put", "delete", "patch"];
+
+    if (httpMethods.includes(methodName)) {
+      const calleeObj = expr.expression;
+      let isHttp = false;
+
+      if (ts.isIdentifier(calleeObj)) {
+        isHttp = httpClients.isHttpClient(calleeObj.text);
+      } else {
+        const expressionText = calleeObj.getText(sourceFile);
+        isHttp = httpClients.isHttpExpression(expressionText);
+      }
+
+      if (isHttp && node.arguments.length > 0) {
+        const url = varMap
+          ? resolveUrlFromExpression(node.arguments[0] as ts.Expression, varMap)
+          : extractUrlFromNode(node.arguments[0]);
+        if (url) {
+          return { method: methodName.toUpperCase(), url, lineNumber: getLineNumber(sourceFile, node.getStart(sourceFile)), callerFunction: callerName };
+        }
+      }
+    }
+  }
+
+  if (ts.isIdentifier(expr) && (expr.text === "fetch" || httpClients.isHttpClient(expr.text))) {
+    if (node.arguments.length > 0) {
+      const url = varMap
+        ? resolveUrlFromExpression(node.arguments[0] as ts.Expression, varMap)
+        : extractUrlFromNode(node.arguments[0]);
+      if (url) {
+        let method = "GET";
+        if (node.arguments.length > 1 && ts.isObjectLiteralExpression(node.arguments[1])) {
+          for (const prop of node.arguments[1].properties) {
+            if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === "method" && ts.isStringLiteral(prop.initializer)) {
+              method = prop.initializer.text.toUpperCase();
+            }
+          }
+        }
+        return { method, url, lineNumber: getLineNumber(sourceFile, node.getStart(sourceFile)), callerFunction: callerName };
+      }
+    }
+  }
+
+  return null;
+}
+
+interface ClassInheritanceInfo {
+  className: string;
+  parentClassName: string;
+  parentImportPath: string | null;
+}
+
+function extractClassInheritance(sourceFile: ts.SourceFile, filePath: string, allFilePaths: string[]): ClassInheritanceInfo[] {
+  const result: ClassInheritanceInfo[] = [];
+  const importMap = new Map<string, string>();
+
+  ts.forEachChild(sourceFile, node => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && node.importClause) {
+      const moduleSpec = node.moduleSpecifier.text;
+      const resolved = normalizeModulePath(filePath, moduleSpec, allFilePaths);
+      if (node.importClause.name) importMap.set(node.importClause.name.text, resolved || moduleSpec);
+      if (node.importClause.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+        for (const spec of node.importClause.namedBindings.elements) {
+          const name = spec.propertyName ? spec.propertyName.text : spec.name.text;
+          importMap.set(name, resolved || moduleSpec);
+        }
+      }
+    }
+  });
+
+  ts.forEachChild(sourceFile, node => {
+    if (ts.isClassDeclaration(node) && node.name && node.heritageClauses) {
+      for (const clause of node.heritageClauses) {
+        if (clause.token === ts.SyntaxKind.ExtendsKeyword && clause.types.length > 0) {
+          const parentExpr = clause.types[0].expression;
+          if (ts.isIdentifier(parentExpr)) {
+            result.push({
+              className: node.name!.text,
+              parentClassName: parentExpr.text,
+              parentImportPath: importMap.get(parentExpr.text) || null,
+            });
+          }
+        }
+      }
+    }
+  });
+
+  return result;
+}
+
+function buildHttpServiceMap(files: { filePath: string; content: string }[]): HttpServiceMap {
+  const serviceMap: HttpServiceMap = new Map();
+  const allFilePaths = files.map(f => f.filePath);
+  const inheritanceChains: { filePath: string; className: string; parentClassName: string; parentFilePath: string }[] = [];
+  const fileClassInstances = new Map<string, Map<string, string>>();
+
+  for (const file of files) {
+    if (file.filePath.includes("node_modules") || file.filePath.includes("dist/") || file.filePath.includes("build/") || file.filePath.includes("__tests__")) {
+      continue;
+    }
+
+    const ext = file.filePath.substring(file.filePath.lastIndexOf("."));
+    if (![".ts", ".js", ".tsx", ".jsx"].includes(ext)) continue;
+
+    try {
+      const sourceFile = parseTypeScript(file.content, file.filePath);
+      const { exportedNames, classInstances, defaultExportName } = extractExports(sourceFile);
+      const classMethodMap = extractClassMethods(sourceFile);
+
+      fileClassInstances.set(file.filePath, classInstances);
+
+      const inheritanceInfos = extractClassInheritance(sourceFile, file.filePath, allFilePaths);
+      for (const info of inheritanceInfos) {
+        if (info.parentImportPath) {
+          inheritanceChains.push({
+            filePath: file.filePath,
+            className: info.className,
+            parentClassName: info.parentClassName,
+            parentFilePath: info.parentImportPath,
+          });
+        }
+      }
+
+      const symbolTable = ScriptSymbolTable.build(sourceFile);
+      const allCalls = symbolTable.getAllHttpCalls();
+
+      const funcCalls = new Map<string, HttpCall[]>();
+      for (const call of allCalls) {
+        if (call.callerFunction) {
+          const existing = funcCalls.get(call.callerFunction) || [];
+          existing.push(call);
+          funcCalls.set(call.callerFunction, existing);
+        }
+      }
+
+      const topCalls = symbolTable.getTopLevelHttpCalls(sourceFile);
+      for (const call of topCalls) {
+        if (call.callerFunction && call.callerFunction !== "__top_level__") {
+          const existing = funcCalls.get(call.callerFunction) || [];
+          existing.push(call);
+          funcCalls.set(call.callerFunction, existing);
+        }
+      }
+
+      const entry: FileServiceEntry = {
+        methods: new Map(),
+        directFunctions: new Map(),
+      };
+
+      let hasContent = false;
+
+      const exportNameArray = Array.from(exportedNames);
+      for (const exportName of exportNameArray) {
+        if (funcCalls.has(exportName)) {
+          entry.directFunctions.set(exportName, funcCalls.get(exportName)!);
+          hasContent = true;
+        }
+
+        const className = classInstances.get(exportName);
+        if (className && classMethodMap.has(className)) {
+          const methods = classMethodMap.get(className)!;
+          methods.forEach((calls, methodName) => {
+            const key = exportName + "." + methodName;
+            entry.methods.set(key, { httpCalls: calls });
+            hasContent = true;
+          });
+        }
+      }
+
+      if (defaultExportName) {
+        if (funcCalls.has(defaultExportName)) {
+          entry.directFunctions.set("default", funcCalls.get(defaultExportName)!);
+          hasContent = true;
+        }
+
+        const className = classInstances.get(defaultExportName) || defaultExportName;
+        if (classMethodMap.has(className)) {
+          const methods = classMethodMap.get(className)!;
+          methods.forEach((calls, methodName) => {
+            entry.methods.set("default." + methodName, { httpCalls: calls });
+            hasContent = true;
+          });
+        }
+      }
+
+      const classMethodEntries = Array.from(classMethodMap.entries());
+      for (const [className, methods] of classMethodEntries) {
+        if (exportedNames.has(className)) {
+          methods.forEach((calls: HttpCall[], methodName: string) => {
+            const key = className + "." + methodName;
+            if (!entry.methods.has(key)) {
+              entry.methods.set(key, { httpCalls: calls });
+              hasContent = true;
+            }
+          });
+        }
+      }
+
+      if (hasContent) {
+        serviceMap.set(file.filePath, entry);
+      }
+    } catch (err) {
+    }
+  }
+
+  for (const chain of inheritanceChains) {
+    const parentEntry = serviceMap.get(chain.parentFilePath);
+    if (!parentEntry) continue;
+
+    let childEntry = serviceMap.get(chain.filePath);
+    if (!childEntry) {
+      childEntry = { methods: new Map(), directFunctions: new Map() };
+      serviceMap.set(chain.filePath, childEntry);
+    }
+
+    const existingMethodNames = new Set<string>();
+    for (const k of childEntry.methods.keys()) {
+      const dot = k.lastIndexOf(".");
+      if (dot >= 0) existingMethodNames.add(k.substring(dot + 1));
+    }
+
+    const instanceMap = fileClassInstances.get(chain.filePath);
+    const exportNames: string[] = [];
+    if (instanceMap) {
+      for (const [varName, className] of instanceMap.entries()) {
+        if (className === chain.className) exportNames.push(varName);
+      }
+    }
+
+    for (const [key, value] of parentEntry.methods.entries()) {
+      const dot = key.lastIndexOf(".");
+      if (dot < 0) continue;
+      const methodName = key.substring(dot + 1);
+      if (existingMethodNames.has(methodName)) continue;
+
+      childEntry.methods.set(chain.className + "." + methodName, value);
+      childEntry.methods.set("default." + methodName, value);
+      for (const exportName of exportNames) {
+        childEntry.methods.set(exportName + "." + methodName, value);
+      }
+    }
+
+    for (const [key, value] of parentEntry.directFunctions.entries()) {
+      if (!childEntry.directFunctions.has(key)) {
+        childEntry.directFunctions.set(key, value);
+      }
+    }
+  }
+
+  console.log(`[frontend-analyzer] HttpServiceMap built: ${serviceMap.size} files with HTTP service functions`);
+  let totalMethods = 0;
+  let totalFunctions = 0;
+  serviceMap.forEach((entry) => {
+    totalMethods += entry.methods.size;
+    totalFunctions += entry.directFunctions.size;
+  });
+  console.log(`[frontend-analyzer] HttpServiceMap: ${totalFunctions} direct functions, ${totalMethods} class methods`);
+
+  return serviceMap;
+}
+
+function parseImportBindings(sourceFile: ts.SourceFile, importerPath: string, allFilePaths: string[]): Map<string, ImportBinding> {
+  const bindings = new Map<string, ImportBinding>();
+
+  const visit = (node: ts.Node) => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      const moduleSpec = node.moduleSpecifier.text;
+      const resolvedPath = normalizeModulePath(importerPath, moduleSpec, allFilePaths);
+      if (!resolvedPath) {
+        ts.forEachChild(node, visit);
+        return;
+      }
+
+      if (node.importClause) {
+        if (node.importClause.name) {
+          bindings.set(node.importClause.name.text, {
+            sourcePath: resolvedPath,
+            originalName: "default",
+            isDefault: true,
+          });
+        }
+
+        if (node.importClause.namedBindings) {
+          if (ts.isNamedImports(node.importClause.namedBindings)) {
+            for (const spec of node.importClause.namedBindings.elements) {
+              const localName = spec.name.text;
+              const originalName = spec.propertyName ? spec.propertyName.text : localName;
+              bindings.set(localName, {
+                sourcePath: resolvedPath,
+                originalName,
+                isDefault: false,
+              });
+            }
+          } else if (ts.isNamespaceImport(node.importClause.namedBindings)) {
+            bindings.set(node.importClause.namedBindings.name.text, {
+              sourcePath: resolvedPath,
+              originalName: "*",
+              isDefault: false,
+            });
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  return bindings;
+}
+
+function extractExternalCalls(body: ts.Node, localNames: Set<string>): ExternalCall[] {
+  const calls: ExternalCall[] = [];
+
+  const walk = (node: ts.Node, enclosingFn: string | null) => {
+    if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      let fnName = enclosingFn;
+      if (ts.isFunctionDeclaration(node) && node.name) fnName = node.name.text;
+      else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) fnName = node.name.text;
+      else if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && node.parent) {
+        if (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) fnName = node.parent.name.text;
+        else if (ts.isPropertyAssignment(node.parent) && ts.isIdentifier(node.parent.name)) fnName = node.parent.name.text;
+      }
+      ts.forEachChild(node, child => walk(child, fnName));
+      return;
+    }
+
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+
+      if (ts.isPropertyAccessExpression(expr)) {
+        const obj = expr.expression;
+        if (ts.isIdentifier(obj) && !localNames.has(obj.text) && obj.text !== "this" && obj.text !== "console" && obj.text !== "Math" && obj.text !== "JSON" && obj.text !== "Object" && obj.text !== "Array" && obj.text !== "Promise" && obj.text !== "window" && obj.text !== "document") {
+          calls.push({
+            importedName: obj.text,
+            methodName: expr.name.text,
+            callerFunction: enclosingFn || "__unknown__",
+          });
+        }
+      }
+
+      if (ts.isIdentifier(expr) && !localNames.has(expr.text) && expr.text !== "fetch" && expr.text !== "setTimeout" && expr.text !== "setInterval" && expr.text !== "clearTimeout" && expr.text !== "clearInterval" && expr.text !== "require") {
+        calls.push({
+          importedName: expr.text,
+          methodName: null,
+          callerFunction: enclosingFn || "__unknown__",
+        });
+      }
+    }
+
+    ts.forEachChild(node, child => walk(child, enclosingFn));
+  };
+
+  walk(body, null);
+  return calls;
+}
+
+function resolveExternalCallsToHttpCalls(
+  externalCalls: ExternalCall[],
+  importBindings: Map<string, ImportBinding>,
+  serviceMap: HttpServiceMap,
+  handlerName: string,
+  symbolTable?: ScriptSymbolTable,
+): HttpCall[] {
+  const results: HttpCall[] = [];
+  const seen = new Set<string>();
+
+  const relevantFunctions = new Set<string>([handlerName, "__unknown__"]);
+  if (symbolTable) {
+    const handlerNode = symbolTable.resolveHandlerNode(handlerName);
+    if (handlerNode) {
+      const visited = new Set<ts.Node>();
+      const collectCalled = (node: ts.Node) => {
+        if (visited.has(node)) return;
+        visited.add(node);
+        const decl = symbolTable!.getDeclaration(node);
+        if (decl && decl.name) {
+          relevantFunctions.add(decl.name);
+          for (const calledNode of decl.calledNodes) {
+            collectCalled(calledNode);
+          }
+        }
+      };
+      collectCalled(handlerNode);
+    }
+  }
+
+  for (const extCall of externalCalls) {
+    if (!relevantFunctions.has(extCall.callerFunction)) continue;
+
+    const binding = importBindings.get(extCall.importedName);
+    if (!binding) continue;
+
+    const fileEntry = serviceMap.get(binding.sourcePath);
+    if (!fileEntry) continue;
+
+    if (extCall.methodName) {
+      const lookupKeys = [
+        binding.originalName + "." + extCall.methodName,
+        "default." + extCall.methodName,
+        extCall.importedName + "." + extCall.methodName,
+      ];
+
+      for (const key of lookupKeys) {
+        if (seen.has(key)) continue;
+        const methodEntry = fileEntry.methods.get(key);
+        if (methodEntry && methodEntry.httpCalls.length > 0) {
+          results.push(...methodEntry.httpCalls);
+          seen.add(key);
+          break;
+        }
+      }
+    } else {
+      const lookupKeys = [binding.originalName, "default", extCall.importedName];
+      for (const key of lookupKeys) {
+        if (seen.has(key)) continue;
+        const funcCalls = fileEntry.directFunctions.get(key);
+        if (funcCalls && funcCalls.length > 0) {
+          results.push(...funcCalls);
+          seen.add(key);
+          break;
+        }
+      }
+    }
+  }
+
+  return results;
 }
 
 function getComponentName(filePath: string): string {
@@ -720,9 +1389,26 @@ function resolveBindingsViaNodes(
   symbolTable: ScriptSymbolTable,
   component: string,
   filePath: string,
-  graph: ApplicationGraph
+  graph: ApplicationGraph,
+  crossFileContext?: { sourceFile: ts.SourceFile; importBindings: Map<string, ImportBinding>; serviceMap: HttpServiceMap }
 ): FrontendInteraction[] {
   const interactions: FrontendInteraction[] = [];
+
+  let externalCalls: ExternalCall[] | null = null;
+  if (crossFileContext) {
+    const localNames = new Set<string>();
+    const visit = (node: ts.Node) => {
+      if (ts.isFunctionDeclaration(node) && node.name) localNames.add(node.name.text);
+      else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) localNames.add(node.name.text);
+      else if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && node.parent) {
+        if (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) localNames.add(node.parent.name.text);
+        else if (ts.isPropertyAssignment(node.parent) && ts.isIdentifier(node.parent.name)) localNames.add(node.parent.name.text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(crossFileContext.sourceFile);
+    externalCalls = extractExternalCalls(crossFileContext.sourceFile, localNames);
+  }
 
   for (const binding of bindings) {
     const handlerNode = symbolTable.resolveHandlerNode(binding.handlerName);
@@ -743,6 +1429,36 @@ function resolveBindingsViaNodes(
             lineNumber: binding.lineNumber,
           });
         }
+      } else if (externalCalls && crossFileContext) {
+        const resolved = resolveExternalCallsToHttpCalls(
+          externalCalls, crossFileContext.importBindings, crossFileContext.serviceMap, binding.handlerName, symbolTable
+        );
+        if (resolved.length > 0) {
+          for (const call of resolved) {
+            const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
+            interactions.push({
+              component,
+              elementType: binding.elementType,
+              actionName: binding.handlerName,
+              httpMethod: call.method,
+              url: call.url,
+              mappedBackendNode: backendNode,
+              sourceFile: filePath,
+              lineNumber: binding.lineNumber,
+            });
+          }
+        } else {
+          interactions.push({
+            component,
+            elementType: binding.elementType,
+            actionName: binding.handlerName,
+            httpMethod: null,
+            url: null,
+            mappedBackendNode: null,
+            sourceFile: filePath,
+            lineNumber: binding.lineNumber,
+          });
+        }
       } else {
         interactions.push({
           component,
@@ -756,16 +1472,48 @@ function resolveBindingsViaNodes(
         });
       }
     } else {
-      interactions.push({
-        component,
-        elementType: binding.elementType,
-        actionName: binding.handlerName,
-        httpMethod: null,
-        url: null,
-        mappedBackendNode: null,
-        sourceFile: filePath,
-        lineNumber: binding.lineNumber,
-      });
+      if (externalCalls && crossFileContext) {
+        const resolved = resolveExternalCallsToHttpCalls(
+          externalCalls, crossFileContext.importBindings, crossFileContext.serviceMap, binding.handlerName, symbolTable
+        );
+        if (resolved.length > 0) {
+          for (const call of resolved) {
+            const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
+            interactions.push({
+              component,
+              elementType: binding.elementType,
+              actionName: binding.handlerName,
+              httpMethod: call.method,
+              url: call.url,
+              mappedBackendNode: backendNode,
+              sourceFile: filePath,
+              lineNumber: binding.lineNumber,
+            });
+          }
+        } else {
+          interactions.push({
+            component,
+            elementType: binding.elementType,
+            actionName: binding.handlerName,
+            httpMethod: null,
+            url: null,
+            mappedBackendNode: null,
+            sourceFile: filePath,
+            lineNumber: binding.lineNumber,
+          });
+        }
+      } else {
+        interactions.push({
+          component,
+          elementType: binding.elementType,
+          actionName: binding.handlerName,
+          httpMethod: null,
+          url: null,
+          mappedBackendNode: null,
+          sourceFile: filePath,
+          lineNumber: binding.lineNumber,
+        });
+      }
     }
   }
 
@@ -775,22 +1523,30 @@ function resolveBindingsViaNodes(
 function analyzeVueFile(
   filePath: string,
   content: string,
-  graph: ApplicationGraph
+  graph: ApplicationGraph,
+  serviceMap?: HttpServiceMap,
+  allFilePaths?: string[]
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const { bindings: templateBindings, scriptContent } = parseVueTemplateAST(content);
 
   let symbolTable: ScriptSymbolTable | null = null;
   let allHttpCalls: HttpCall[] = [];
+  let crossFileContext: { sourceFile: ts.SourceFile; importBindings: Map<string, ImportBinding>; serviceMap: HttpServiceMap } | undefined;
 
   if (scriptContent.trim()) {
     const scriptSource = parseTypeScript(scriptContent, filePath + ".script.ts");
     symbolTable = ScriptSymbolTable.build(scriptSource);
     allHttpCalls = [...symbolTable.getAllHttpCalls(), ...symbolTable.getTopLevelHttpCalls(scriptSource)];
+
+    if (serviceMap && allFilePaths) {
+      const importBindings = parseImportBindings(scriptSource, filePath, allFilePaths);
+      crossFileContext = { sourceFile: scriptSource, importBindings, serviceMap };
+    }
   }
 
   const interactions = symbolTable
-    ? resolveBindingsViaNodes(templateBindings, symbolTable, component, filePath, graph)
+    ? resolveBindingsViaNodes(templateBindings, symbolTable, component, filePath, graph, crossFileContext)
     : templateBindings.map(b => ({
         component,
         elementType: b.elementType,
@@ -810,7 +1566,9 @@ function analyzeVueFile(
 function analyzeReactFile(
   filePath: string,
   content: string,
-  graph: ApplicationGraph
+  graph: ApplicationGraph,
+  serviceMap?: HttpServiceMap,
+  allFilePaths?: string[]
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const sourceFile = parseTypeScript(content, filePath);
@@ -818,8 +1576,14 @@ function analyzeReactFile(
   const jsxBindings = parseJSXTemplate(sourceFile);
   const allHttpCalls = [...symbolTable.getAllHttpCalls(), ...symbolTable.getTopLevelHttpCalls(sourceFile)];
 
+  let crossFileContext: { sourceFile: ts.SourceFile; importBindings: Map<string, ImportBinding>; serviceMap: HttpServiceMap } | undefined;
+  if (serviceMap && allFilePaths) {
+    const importBindings = parseImportBindings(sourceFile, filePath, allFilePaths);
+    crossFileContext = { sourceFile, importBindings, serviceMap };
+  }
+
   const interactions = resolveBindingsViaNodes(
-    jsxBindings, symbolTable, component, filePath, graph
+    jsxBindings, symbolTable, component, filePath, graph, crossFileContext
   );
 
   addUnmappedHttpCalls(interactions, allHttpCalls, component, filePath, graph);
@@ -831,7 +1595,9 @@ function analyzeAngularFile(
   filePath: string,
   content: string,
   graph: ApplicationGraph,
-  htmlTemplates: Map<string, string>
+  htmlTemplates: Map<string, string>,
+  serviceMap?: HttpServiceMap,
+  allFilePaths?: string[]
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const interactions: FrontendInteraction[] = [];
@@ -879,10 +1645,16 @@ function analyzeAngularFile(
     }
   }
 
+  let crossFileContext: { sourceFile: ts.SourceFile; importBindings: Map<string, ImportBinding>; serviceMap: HttpServiceMap } | undefined;
+  if (serviceMap && allFilePaths) {
+    const importBindings = parseImportBindings(sourceFile, filePath, allFilePaths);
+    crossFileContext = { sourceFile, importBindings, serviceMap };
+  }
+
   if (templateContent) {
     const templateBindings = parseAngularTemplateAST(templateContent);
     const resolved = resolveBindingsViaNodes(
-      templateBindings, symbolTable, component, filePath, graph
+      templateBindings, symbolTable, component, filePath, graph, crossFileContext
     );
     interactions.push(...resolved);
   }
@@ -985,6 +1757,11 @@ export function analyzeFrontend(
   const interactions: FrontendInteraction[] = [];
   const htmlTemplates = new Map<string, string>();
 
+  const serviceMap = buildHttpServiceMap(files);
+  const allFilePaths = files.map(f => f.filePath);
+  let crossFileResolved = 0;
+  let crossFileAttempted = 0;
+
   for (const file of files) {
     if (file.filePath.endsWith(".html")) {
       htmlTemplates.set(file.filePath, file.content);
@@ -1002,18 +1779,18 @@ export function analyzeFrontend(
     try {
       switch (fileType) {
         case "vue":
-          interactions.push(...analyzeVueFile(file.filePath, file.content, graph));
+          interactions.push(...analyzeVueFile(file.filePath, file.content, graph, serviceMap, allFilePaths));
           break;
 
         case "react":
-          interactions.push(...analyzeReactFile(file.filePath, file.content, graph));
+          interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths));
           break;
 
         case "javascript":
           if (isAngularComponent(file.content)) {
-            interactions.push(...analyzeAngularFile(file.filePath, file.content, graph, htmlTemplates));
+            interactions.push(...analyzeAngularFile(file.filePath, file.content, graph, htmlTemplates, serviceMap, allFilePaths));
           } else {
-            interactions.push(...analyzeReactFile(file.filePath, file.content, graph));
+            interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths));
           }
           break;
 
@@ -1038,6 +1815,11 @@ export function analyzeFrontend(
       console.error(`[frontend-analyzer] Error analyzing ${file.filePath}:`, err instanceof Error ? err.message : err);
     }
   }
+
+  const withUrls = interactions.filter(i => i.url);
+  const withoutUrls = interactions.filter(i => !i.url);
+  const matched = interactions.filter(i => i.mappedBackendNode);
+  console.log(`[frontend-analyzer] Results: ${interactions.length} interactions, ${withUrls.length} with URLs (${withoutUrls.length} without), ${matched.length} matched to backend`);
 
   return interactions;
 }

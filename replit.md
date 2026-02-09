@@ -1,179 +1,48 @@
 # PermaCat - Code-to-Permission Catalog Generator
 
 ## Overview
-Enterprise-grade static code intelligence tool that analyzes frontend (Vue/React/Angular) and Spring Boot backend source code to automatically generate a Technical Action Catalog for IAM (Identity and Access Management) systems.
+PermaCat is an enterprise-grade static code intelligence tool designed to analyze frontend (Vue/React/Angular) and Spring Boot backend source code. Its primary purpose is to automatically generate a Technical Action Catalog for Identity and Access Management (IAM) systems. This tool aims to streamline the process of understanding and managing permissions by providing a comprehensive overview of technical operations derived directly from the codebase.
 
-## Architecture
-- **Frontend**: React + TypeScript + Shadcn UI + TailwindCSS
-- **Backend**: Express + TypeScript + Drizzle ORM + PostgreSQL
-- **Java Analysis Engine**: Standalone JVM service using JavaParser AST library for Spring Boot code analysis
-- **Frontend Analysis Engine**: TypeScript compiler API (React/JS/TS), @vue/compiler-sfc (Vue SFCs), @angular/compiler (Angular templates)
-- **Semantic Engine**: OpenAI LLM (via Replit AI Integrations) for classifying technical operations and criticality scores
+## User Preferences
+I want iterative development. I expect you to ask clarifying questions about the implementation details and decisions. I prefer detailed explanations for complex parts of the code.
 
-## Key Features
-1. **ZIP Repository Upload**: Upload a ZIP of an entire repository for automatic scanning and analysis
-2. Upload individual project source files (Vue/React/Angular frontend + Java Spring Boot backend)
-3. Analyze frontend for interaction points (buttons, forms, HTTP calls, navigation) using real AST parsers
-4. Parse Java controllers, services, repositories, and entities using JavaParser (JVM-based AST)
-5. Build a graph connecting frontend interactions to backend endpoints with full method tracing
-6. LLM-powered semantic classification of technical operations and criticality scores
-7. Backend-only catalog generation from endpoint impacts when no frontend files exist
-8. Editable catalog with human classification support
-9. JSON export of the full catalog
+## System Architecture
+The application features a frontend built with React, TypeScript, Shadcn UI, and TailwindCSS. The backend is powered by Express, TypeScript, Drizzle ORM, and PostgreSQL. A standalone JVM service, utilizing the JavaParser AST library, handles Spring Boot code analysis. Frontend analysis is performed using the TypeScript compiler API (React/JS/TS), `@vue/compiler-sfc` (Vue SFCs), and `@angular/compiler` (Angular templates). A Semantic Engine, powered by OpenAI LLM (via Replit AI Integrations), is used for classifying technical operations and assigning criticality scores.
 
-## Project Structure
-```
-java-analyzer-engine/           - Standalone Java service (JavaParser + Symbol Solver)
-  pom.xml                       - Maven build with JavaParser, Gson dependencies
-  src/main/java/com/permacat/
-    analyzer/
-      AnalyzerServer.java       - HTTP server (port 9876) with /analyze and /health endpoints
-      JavaASTAnalyzer.java      - JavaParser-based AST analyzer for Spring Boot code
-    model/
-      GraphNodeDTO.java         - Node DTO matching ApplicationGraph format
-      GraphEdgeDTO.java         - Edge DTO matching ApplicationGraph format
-      AnalysisResult.java       - Response model (nodes + edges)
+Key features include ZIP repository upload for automatic scanning, individual file uploads, AST-based parsing of frontend interaction points and Java backend components (controllers, services, repositories, entities), and building a graph connecting frontend interactions to backend endpoints with full method tracing. The system supports backend-only catalog generation, an editable catalog with human classification support, and JSON export.
 
-client/src/
-  App.tsx                       - Main app with sidebar layout
-  pages/
-    dashboard.tsx               - Overview stats and recent activity
-    upload.tsx                  - Project file upload (paste or file upload)
-    catalog.tsx                 - Catalog viewer with filters, search, detail dialog
-  components/
-    app-sidebar.tsx             - Navigation sidebar
-    theme-toggle.tsx            - Dark/light mode toggle
-  lib/
-    theme-provider.tsx          - Theme context provider
+The Java Backend Analyzer uses JavaParser with JavaSymbolSolver for semantic AST analysis, resolving method calls, and tracing repository-to-entity relationships via generics. It runs as an HTTP service, auto-started by the Node.js client. The Frontend Analyzer, built in Node.js, uses framework-specific AST parsers to resolve handlers, trace HTTP calls, and identify HTTP client identifiers. It implements a two-pass architecture for cross-file HTTP service resolution, handling imported functions and local variable URL tracing.
 
-server/
-  index.ts                      - Express server entry (20min HTTP timeouts for large uploads)
-  routes.ts                     - API endpoints (SSE streaming progress for ZIP upload)
-  storage.ts                    - Database storage layer (IStorage interface)
-  db.ts                         - Database connection
-  seed.ts                       - Sample project seed data
-  analyzers/
-    application-graph.ts        - ApplicationGraph model (GraphNode, GraphEdge, analyzeEndpoints)
-    backend-java-client.ts      - Node.js client that spawns/communicates with Java engine
-    frontend-analyzer.ts        - AST-based frontend analyzer (Vue/React/Angular)
-    graph-connector.ts          - Converts FrontendInteractions/EndpointImpacts to catalog entries
-    repository-scanner.ts       - ZIP extraction and recursive directory scanning
-    deterministic-classifier.ts - Rule-based classification (httpMethod, persistenceOps, entities)
-    semantic-engine.ts          - Optional LLM enrichment (POST /api/enrich-with-llm/:projectId)
+The system constructs an in-memory Application Graph model to represent the backend, with `GraphNode` and `GraphEdge` objects, allowing for detailed traversal and impact analysis per controller endpoint. The data flow involves storing uploaded source files, analyzing them with both Java and Node.js engines, reconstructing the Application Graph, generating `EndpointImpact` objects, and then converting `FrontendInteractions` into catalog entries. A deterministic classifier assigns `technicalOperation`, `criticalityScore`, and `suggestedMeaning` based on predefined rules, with an optional LLM enrichment step for refinement. The system also includes a robust repository scanner for ZIP file processing, handling large files efficiently by ignoring irrelevant directories and supporting chunked uploads to bypass size limitations.
 
-shared/
-  schema.ts                     - Drizzle ORM schema (projects, source_files, analysis_runs, catalog_entries)
-```
+## Frontend Analyzer Details
 
-## Analyzer Architecture
+### Cross-File HTTP Service Resolution (Two-Pass Architecture)
+- **Pass 1 — HttpServiceMap**: Pre-scan ALL source files to build a global map of exported functions/methods that contain HTTP calls
+  - `HttpServiceMap`: `Map<filePath, Map<exportName, HttpServiceEntry>>` where entry = `{url, method, functionName}`
+  - Scans function declarations, arrow functions, class methods for HTTP call expressions
+  - Tracks class inheritance: `extends` clauses merge parent HTTP methods into child classes
+  - Handles default exports, named exports, and class method exports with multiple key prefixes (`className.method`, `default.method`, `exportName.method`)
+- **Pass 2 — Import Resolution**: When single-file `traceHttpCalls` returns no results, resolves via cross-file imports
+  - `resolveImportedServiceMap(fileImports, httpServiceMap)` maps import specifiers to service entries
+  - Supports `@/` alias resolution (maps to `src/` directory) and relative path resolution
+  - `resolveBindingsViaNodes(bindings, resolvedImports)` performs transitive call graph traversal: traces handler → imported function → HTTP call
+  - Depth-limited to 5 levels to prevent cycles
+- **Local Variable URL Tracing**: `resolveUrlFromExpression` recursively resolves identifiers in template literals, binary expressions, and call expressions
+  - Template expressions: resolves each span identifier via `varMap` before substituting `{param}`
+  - `buildEndpoint()` / `buildUrl()` pattern: extracts string arguments → `{base}/operation`
+  - BaseApiService pattern: `buildEndpoint('create', true)` → `{base}/create`, enabling 100% match rate to WS operation controllers
+- **Architecture detection** (`architecture-detector.ts`): Classifies backend as REST_CONTROLLER (standard `/api/` paths) or WS_OPERATION_BASED (WebSocket-like controllers using className matching); affects URL-to-controller matching strategy
+- **Validated on large production codebase** (easynup): URL extraction 6.3x improvement (146→918), controller matching 4.4x improvement (146→636), {base} URLs 100% matched (304/304)
 
-### Java Backend Analyzer (JVM-based) — PURE SYMBOL RESOLUTION
-- Uses **JavaParser** library with **JavaSymbolSolver** for semantic AST analysis
-- **CombinedTypeSolver**: ReflectionTypeSolver (JDK types) + JavaParserTypeSolver (project source types)
-- Writes source files to temp directory for JavaParserTypeSolver filesystem access
-- **SymbolMap**: Maps `ResolvedReferenceTypeDeclaration` → `ClassInfo` (qualified-name-keyed internally for proper identity across resolve() calls)
-- `cls.resolve()` binds each `ClassOrInterfaceDeclaration` to its resolved symbol during class scanning phase
-- `callExpr.resolve()` resolves method calls; `resolved.declaringType()` used as primary key into SymbolMap to find target ClassInfo
-- **Scope type fallback**: when `declaringType()` resolves to a framework class (e.g., JpaRepository), falls back to `callExpr.getScope().calculateResolvedType()` to find the actual field type (e.g., UserRepository) in SymbolMap — enables service→repository edges for inherited methods
-- **MethodCallInfo** stores both `resolvedDeclaringType` (declaring class) and `resolvedScopeType` (callee field type) for two-level lookup
-- **No heuristic fallback**: if `callExpr.resolve()` fails, the edge is silently skipped (no processHeuristicCall, no resolveTargetType, no isInjectableType)
-- **Repository→Entity via generics**: extracts entity type from `JpaRepository<Entity, ID>` generic type parameters using `typeArgs.get(0).resolve()` through symbol solver — no naming convention (`UserRepository→User` removed)
-- **ClassInfo** stores `ResolvedReferenceTypeDeclaration resolvedSymbol` and `resolvedEntitySymbol` for repositories
-- **ReflectionTypeSolver(false)**: includes full classpath (Spring framework JARs) for resolving inherited framework methods
-- Runs as a standalone HTTP service on port 9876 (auto-started by Node.js client)
-- Detects: @RestController, @Service, @Repository, @Entity annotations via AST
-- Returns JSON matching ApplicationGraph node/edge format with WRITES_ENTITY/READS_ENTITY edges from repository→entity resolution
-
-### Frontend Analyzer (Node.js-based) — PURE NODE REFERENCE RESOLUTION
-- **ScriptSymbolTable**: `nodeMap: Map<ts.Node, SymbolDeclaration>` (node-keyed), `nameIndex: Map<string, ts.Node>` (thin name→node index for initial template binding)
-- **SymbolDeclaration**: `calledNodes: ts.Node[]` (node references, not string names)
-- **Handler resolution**: `resolveHandlerNode(name) → ts.Node` resolves template handler name to AST node ONCE; all subsequent tracing uses node references
-- **Call chain tracing**: `traceHttpCalls(node: ts.Node)` follows `calledNodes: ts.Node[]` graph — no string-based trace
-- **ImportedHttpClients**: Indexes import declarations to identify HTTP client identifiers (axios, @angular/common/http, api/service imports); CallExpression callee objects verified against imported identifiers instead of pattern-matching against string lists
-- **React/JSX/TSX**: TypeScript compiler API (ts.createSourceFile) for full AST parsing
-- **Vue SFCs**: @vue/compiler-sfc for SFC parsing + template AST walking, TypeScript compiler API for script blocks
-- **Angular**: @angular/compiler (parseTemplate) for template AST, TypeScript compiler API for component files
-- **URL matching**: Segment-by-segment URL scoring against ApplicationGraph controller nodes
-
-## Application Graph Model
-The backend is represented as a navigable in-memory graph:
-- **GraphNode** (id, type: CONTROLLER|SERVICE|REPOSITORY|ENTITY, className, methodName, qualifiedSignature, metadata)
-- **Node IDs** are built from resolved symbols:
-  - Method nodes: `type + ":" + ResolvedMethodDeclaration.getQualifiedSignature()` (e.g., `CONTROLLER:com.example.controller.UserController.getAll()`)
-  - Entity nodes: `ENTITY: + ResolvedReferenceTypeDeclaration.getQualifiedName()` (e.g., `ENTITY:com.example.model.User`)
-  - Repository class nodes: `REPOSITORY: + ResolvedReferenceTypeDeclaration.getQualifiedName()`
-  - Synthetic repo method nodes: scope type qualified name + method signature (requalified from declaring type)
-- **GraphEdge** (fromNode, toNode, relationType: CALLS|WRITES_ENTITY|READS_ENTITY, metadata) — edges connect via qualified signature IDs
-- **ApplicationGraph** class with addNode/addEdge, getNodesByType, reachableFrom(nodeId), toJSON
-- **GraphNode.id comes from Java engine** — Node.js GraphNode accepts id parameter directly (no local construction)
-- **buildApplicationGraphAsync(files)** calls Java engine then reconstructs graph from JSON
-- **analyzeGraphEndpoints(graph)** traverses the graph per controller endpoint to produce EndpointImpact
-- **EndpointImpact** contains endpoint, involvedNodes, entitiesTouched, callDepth, fullCallChain, persistenceOperations
-- **resolveMethodSignatures()** — separate pass after resolveClassSymbols() that resolves each MethodDeclaration to get its qualified signature; methods that fail resolution are excluded from the graph
-
-## Data Flow
-1. User uploads source files → stored in `source_files` table
-2. Analysis triggered → Java files sent to JVM engine, frontend files analyzed in Node.js
-3. Java engine parses all Java files via JavaParser AST → returns nodes + edges JSON
-4. Node.js client reconstructs ApplicationGraph from JSON response
-5. analyzeGraphEndpoints() traverses the graph per controller endpoint to produce EndpointImpact
-6. analyzeFrontend() uses framework-specific AST parsers to extract UI elements with event handlers, trace handler functions to HTTP calls, and match URLs to controller nodes in ApplicationGraph
-7. Graph connector converts FrontendInteractions (with mapped GraphNodes) into catalog entries, traversing ApplicationGraph for full call chains
-8. Deterministic classifier assigns technicalOperation, criticalityScore, suggestedMeaning using rules (httpMethod, persistenceOps, entities)
-9. Catalog entries stored in database
-10. (Optional) User triggers LLM enrichment via POST /api/enrich-with-llm/:projectId to refine classifications
-11. UI displays with filtering, search, editing, and JSON export
-
-## API Endpoints
-- GET /api/stats - Dashboard statistics
-- GET /api/projects - List all projects
-- POST /api/projects - Create project with source files
-- POST /api/projects/:id/analyze - Run analysis pipeline
-- POST /api/projects/upload-zip - Upload ZIP repository, auto-scan, and analyze (multipart/form-data, legacy single-request)
-- POST /api/uploads/init - Initialize chunked upload session (returns uploadId)
-- POST /api/uploads/:uploadId/chunk - Upload a single chunk (multipart/form-data, max 60MB per chunk)
-- POST /api/uploads/:uploadId/complete - Finalize chunked upload and trigger analysis (SSE streaming)
-- GET /api/catalog-entries/:projectId - Get catalog entries
-- PATCH /api/catalog-entries/:id - Update human classification
-- GET /api/catalog-entries/:projectId/export - Export catalog as JSON
-- POST /api/enrich-with-llm/:projectId - Optional LLM enrichment of existing catalog entries
-- GET /api/analysis-runs/recent - Recent analysis runs
-
-## Repository Scanner Module
-- **File**: `server/analyzers/repository-scanner.ts`
-- **Function**: `extractAndScanZip(zipPathOrBuffer: string | Buffer)` → `ScannedFile[]`
-- **Supported extensions**: .java, .ts, .tsx, .js, .jsx, .vue, .py, .cs
-- **Ignored directories**: node_modules, .git, dist, build, target, .idea, .vscode, .gradle, __pycache__, etc.
-- **Max file size**: 512 KB per file
-- **ZIP root stripping**: Automatically strips the top-level folder from ZIP paths
-- Uses `adm-zip` for ZIP extraction; accepts file path (disk) or Buffer (memory)
-- **Disk-based upload**: multer writes ZIP to /tmp via diskStorage, scanner reads from disk path — avoids loading entire ZIP into Node.js heap (critical for 1GB+ ZIPs)
-- Temp files cleaned up after processing (success and error paths)
-
-## Chunked Upload System
-- **Purpose**: Bypass Replit proxy limits (~200-500MB per single request) for large ZIP uploads (1GB+)
-- **Chunk size**: 50 MB per chunk (within proxy limits)
-- **Flow**: Browser splits ZIP → init session → send chunks sequentially → complete triggers analysis
-- **Backend state**: In-memory `Map<uploadId, ChunkedUploadSession>` with 1-hour auto-expiry
-- **Chunk assembly**: Each chunk written at correct offset via `fs.writeSync(fd, data, 0, len, offset)` into a single temp file
-- **Retry**: Frontend retries each chunk up to 3 times with exponential backoff
-- **Cleanup**: Temp file and session deleted after analysis completes (success or error)
-- **Legacy**: Single-request `/api/projects/upload-zip` still available for smaller files
-
-## Upload & Analysis Timeouts
-- HTTP server: 25-minute timeout (requestTimeout, headersTimeout, keepAliveTimeout, timeout)
-- Multer: 2GB max file size (legacy), 60MB per chunk (chunked upload), diskStorage to /tmp
-- Java engine fetch: 25-minute abort controller timeout
-- Frontend fetch: 25-minute abort controller timeout
-- JVM heap: -Xmx2g -Xms512m for large projects
-- Node.js heap: 4GB (--max-old-space-size=4096 via NODE_OPTIONS)
-- SSE streaming: ZIP upload uses Server-Sent Events to stream progress in real-time
-  - Heartbeat every 15s prevents proxy/LB idle disconnects
-  - Events: `progress` (step + detail), `complete` (result), `error` (message)
-  - Frontend reads via ReadableStream and shows live progress log
-- Diagnostic logging: memory usage at 8 checkpoints, timestamps per phase, file save progress every 100 files
-
-## System Dependencies
-- Java JDK 17 (for JavaParser-based analyzer engine)
-- Maven (for building the Java analyzer JAR)
-- Node.js 20 (for Express server and frontend analyzers)
+## External Dependencies
+- PostgreSQL
+- OpenAI LLM (via Replit AI Integrations)
+- Java JDK 17
+- Maven
+- Node.js 20
+- `JavaParser` library with `JavaSymbolSolver`
+- `@vue/compiler-sfc`
+- `@angular/compiler`
+- `adm-zip`
+- `multer`
