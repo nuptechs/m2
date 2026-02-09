@@ -117,12 +117,18 @@ public class JavaASTAnalyzer {
                     resolutionErrors.add(msg);
                 }
             }
-            System.out.println("[java-engine] Phase 3/7: Parse " + files.size() + " files — " + (System.currentTimeMillis() - phaseStart) + "ms ("
+            System.out.println("[java-engine] Phase 3/8: Parse " + files.size() + " files — " + (System.currentTimeMillis() - phaseStart) + "ms ("
                 + compilationUnits.size() + " OK, " + parseErrors + " errors, " + fqnIndex.size() + " classes found)");
 
             phaseStart = System.currentTimeMillis();
+            resolveSuperclassBasePaths();
+            long controllersFound = fqnIndex.values().stream().filter(ci -> ci.isController).count();
+            System.out.println("[java-engine] Phase 3.5/8: Resolve superclass base paths — " + (System.currentTimeMillis() - phaseStart) + "ms ("
+                + controllersFound + " controllers detected)");
+
+            phaseStart = System.currentTimeMillis();
             resolveClassSymbols(compilationUnits, resolutionErrors);
-            System.out.println("[java-engine] Phase 4/7: Resolve class symbols — " + (System.currentTimeMillis() - phaseStart) + "ms ("
+            System.out.println("[java-engine] Phase 4/8: Resolve class symbols — " + (System.currentTimeMillis() - phaseStart) + "ms ("
                 + symbolClassMap.byQualifiedName.size() + " resolved)");
 
             phaseStart = System.currentTimeMillis();
@@ -131,14 +137,14 @@ public class JavaASTAnalyzer {
             long resolvedMethods = fqnIndex.values().stream()
                 .flatMap(ci -> ci.methods.stream())
                 .filter(m -> m.resolvedQualifiedSignature != null).count();
-            System.out.println("[java-engine] Phase 5/7: Resolve method signatures — " + (System.currentTimeMillis() - phaseStart) + "ms ("
+            System.out.println("[java-engine] Phase 5/8: Resolve method signatures — " + (System.currentTimeMillis() - phaseStart) + "ms ("
                 + resolvedMethods + "/" + totalMethods + " resolved)");
 
             phaseStart = System.currentTimeMillis();
             resolveRepositoryEntitiesViaGenerics(compilationUnits, resolutionErrors);
             long reposWithEntity = fqnIndex.values().stream()
                 .filter(ci -> ci.isRepository && ci.resolvedEntityClassName != null).count();
-            System.out.println("[java-engine] Phase 6/7: Resolve repository entities — " + (System.currentTimeMillis() - phaseStart) + "ms ("
+            System.out.println("[java-engine] Phase 6/8: Resolve repository entities — " + (System.currentTimeMillis() - phaseStart) + "ms ("
                 + reposWithEntity + " repos linked to entities)");
 
         } catch (Exception e) {
@@ -152,7 +158,7 @@ public class JavaASTAnalyzer {
 
         long phaseStart = System.currentTimeMillis();
         AnalysisResult result = buildGraph(resolutionErrors);
-        System.out.println("[java-engine] Phase 7/7: Build graph — " + (System.currentTimeMillis() - phaseStart) + "ms");
+        System.out.println("[java-engine] Phase 8/8: Build graph — " + (System.currentTimeMillis() - phaseStart) + "ms");
         System.out.println("[java-engine] Total analysis time: " + ((System.currentTimeMillis() - totalStart) / 1000.0) + "s");
         return result;
     }
@@ -352,7 +358,6 @@ public class JavaASTAnalyzer {
                 .map(a -> a.getNameAsString())
                 .collect(Collectors.toList());
 
-            info.isController = annotations.stream().anyMatch(CONTROLLER_ANNOTATIONS::contains);
             info.isService = annotations.stream().anyMatch(SERVICE_ANNOTATIONS::contains);
             info.isRepository = annotations.stream().anyMatch(REPOSITORY_ANNOTATIONS::contains);
             info.isEntity = annotations.stream().anyMatch(ENTITY_ANNOTATIONS::contains);
@@ -372,6 +377,10 @@ public class JavaASTAnalyzer {
                 }
             }
 
+            if (!cls.getExtendedTypes().isEmpty()) {
+                info.superClassName = cls.getExtendedTypes().get(0).getNameAsString();
+            }
+
             String classLevelPath = "";
             for (AnnotationExpr ann : cls.getAnnotations()) {
                 if (ann.getNameAsString().equals("RequestMapping")) {
@@ -386,8 +395,48 @@ public class JavaASTAnalyzer {
 
             extractMethods(cls, info);
 
+            boolean hasClassAnnotation = annotations.stream().anyMatch(CONTROLLER_ANNOTATIONS::contains);
+            boolean hasHttpMethods = info.methods.stream().anyMatch(m -> m.httpMethod != null);
+            info.isController = hasClassAnnotation || hasHttpMethods;
+
             fqnIndex.put(info.fqn, info);
         }
+    }
+
+    private void resolveSuperclassBasePaths() {
+        for (ClassInfo info : fqnIndex.values()) {
+            if (!info.isController) continue;
+            if (!info.basePath.isEmpty()) continue;
+
+            String resolvedPath = resolveBasepathFromSuperclass(info, new HashSet<>());
+            if (resolvedPath != null && !resolvedPath.isEmpty()) {
+                info.basePath = resolvedPath;
+                for (MethodInfo m : info.methods) {
+                    if (m.httpMethod != null) {
+                        m.httpPath = combinePaths(resolvedPath, m.httpPath != null ? m.httpPath : "");
+                    }
+                }
+                System.out.println("[java-engine] Resolved superclass basePath for " + info.className + ": " + resolvedPath);
+            }
+        }
+    }
+
+    private String resolveBasepathFromSuperclass(ClassInfo info, Set<String> visited) {
+        if (info.superClassName == null) return null;
+        if (!visited.add(info.fqn)) return null;
+
+        for (ClassInfo candidate : fqnIndex.values()) {
+            if (candidate.className.equals(info.superClassName)) {
+                if (!candidate.basePath.isEmpty()) {
+                    return candidate.basePath;
+                }
+                String parentPath = resolveBasepathFromSuperclass(candidate, visited);
+                if (parentPath != null && !parentPath.isEmpty()) {
+                    return parentPath;
+                }
+            }
+        }
+        return null;
     }
 
     private void extractEntityFields(ClassOrInterfaceDeclaration cls, ClassInfo info) {
@@ -793,6 +842,7 @@ public class JavaASTAnalyzer {
         boolean isRepository;
         boolean isEntity;
         String basePath = "";
+        String superClassName;
         ResolvedReferenceTypeDeclaration resolvedSymbol;
         ResolvedReferenceTypeDeclaration resolvedEntitySymbol;
         String resolvedEntityClassName;
