@@ -11,6 +11,7 @@ import { buildApplicationGraph, analyzeGraphEndpoints } from "./analyzers/backen
 import { interactionsToCatalogEntries, endpointImpactsToCatalogEntries } from "./analyzers/graph-connector";
 import { classifyEntries } from "./analyzers/semantic-engine";
 import { classifyEntriesDeterministic } from "./analyzers/deterministic-classifier";
+import { detectArchitecture } from "./analyzers/architecture-detector";
 import { extractAndScanZip, getFileType } from "./analyzers/repository-scanner";
 import { z } from "zod";
 
@@ -198,6 +199,10 @@ export async function registerRoutes(
         const resolutionErrors = buildResult.resolutionErrors;
         console.log(`[analysis] Step 1/4 done in ${((Date.now() - graphStart2) / 1000).toFixed(1)}s — ${appGraph.toJSON().nodes.length} nodes, ${appGraph.toJSON().edges.length} edges`);
 
+        const archResult = detectArchitecture(appGraph, fileData);
+        console.log(`[analysis] Architecture detected: ${archResult.type} (confidence: ${archResult.confidence.toFixed(2)})`);
+        archResult.evidence.forEach((e) => console.log(`[analysis]   → ${e}`));
+
         console.log(`[analysis] Step 2/4: Analyzing graph endpoints...`);
         const endpointImpacts = analyzeGraphEndpoints(appGraph);
         console.log(`[analysis] Step 2/4 done — ${endpointImpacts.length} endpoints found`);
@@ -207,7 +212,7 @@ export async function registerRoutes(
         console.log(`[analysis] Step 3/4 done — ${frontendInteractions.length} frontend interactions found`);
 
         let catalogEntryData = interactionsToCatalogEntries(
-          frontendInteractions, appGraph, analysisRun.id, projectId
+          frontendInteractions, appGraph, analysisRun.id, projectId, archResult.type
         );
 
         if (catalogEntryData.length === 0 && endpointImpacts.length > 0) {
@@ -523,6 +528,10 @@ export async function registerRoutes(
         logMemory("chunked-after-java-engine");
         sendProgress("Step 1/4", `Done in ${((Date.now() - graphStart) / 1000).toFixed(1)}s — ${appGraph.toJSON().nodes.length} nodes, ${appGraph.toJSON().edges.length} edges`);
 
+        const archResult2 = detectArchitecture(appGraph, fileData);
+        sendProgress("Architecture", `Detected: ${archResult2.type} (confidence: ${archResult2.confidence.toFixed(2)})`);
+        archResult2.evidence.forEach((e) => console.log(`[analysis]   → ${e}`));
+
         sendProgress("Step 2/4", "Analyzing graph endpoints...");
         const endpointImpacts = analyzeGraphEndpoints(appGraph);
         sendProgress("Step 2/4", `Done — ${endpointImpacts.length} endpoints found`);
@@ -533,7 +542,7 @@ export async function registerRoutes(
         sendProgress("Step 3/4", `Done in ${((Date.now() - feStart) / 1000).toFixed(1)}s — ${frontendInteractions.length} frontend interactions found`);
 
         let catalogEntryData = interactionsToCatalogEntries(
-          frontendInteractions, appGraph, analysisRun.id, project.id
+          frontendInteractions, appGraph, analysisRun.id, project.id, archResult2.type
         );
 
         if (catalogEntryData.length === 0 && endpointImpacts.length > 0) {
@@ -796,6 +805,10 @@ export async function registerRoutes(
         logMemory("after-java-engine");
         sendProgress("Step 1/4", `Done in ${((Date.now() - graphStart) / 1000).toFixed(1)}s — ${appGraph.toJSON().nodes.length} nodes, ${appGraph.toJSON().edges.length} edges`);
 
+        const archResult3 = detectArchitecture(appGraph, fileData);
+        sendProgress("Architecture", `Detected: ${archResult3.type} (confidence: ${archResult3.confidence.toFixed(2)})`);
+        archResult3.evidence.forEach((e) => console.log(`[analysis]   → ${e}`));
+
         sendProgress("Step 2/4", "Analyzing graph endpoints...");
         const endpointImpacts = analyzeGraphEndpoints(appGraph);
         sendProgress("Step 2/4", `Done — ${endpointImpacts.length} endpoints found`);
@@ -806,7 +819,7 @@ export async function registerRoutes(
         sendProgress("Step 3/4", `Done in ${((Date.now() - feStart) / 1000).toFixed(1)}s — ${frontendInteractions.length} frontend interactions found`);
 
         let catalogEntryData = interactionsToCatalogEntries(
-          frontendInteractions, appGraph, analysisRun.id, project.id
+          frontendInteractions, appGraph, analysisRun.id, project.id, archResult3.type
         );
 
         if (catalogEntryData.length === 0 && endpointImpacts.length > 0) {

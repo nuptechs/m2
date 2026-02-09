@@ -1,6 +1,7 @@
 import type { FrontendInteraction } from "./frontend-analyzer";
 import type { ApplicationGraph, EndpointImpact, GraphNode } from "./application-graph";
 import type { InsertCatalogEntry } from "@shared/schema";
+import type { ArchitectureType } from "./architecture-detector";
 
 const IGNORED_CONTROLLERS = new Set([
   "healthcheckcontroller",
@@ -419,14 +420,111 @@ function matchByKeywordIntersection(
   return bestScore >= 25 ? bestNode : null;
 }
 
+function extractWsOperationSegment(url: string): string | null {
+  const cleaned = url
+    .replace(/\?.*$/, "")
+    .replace(/\$\{[^}]+\}/g, "")
+    .replace(/`/g, "")
+    .replace(/\+\s*\w+/g, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "");
+
+  const segments = cleaned.split("/").filter(Boolean);
+
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i];
+    if (seg.startsWith("{") || seg.startsWith(":") || /^\d+$/.test(seg)) continue;
+    if (seg === "{param}") continue;
+    const withoutExt = seg.replace(/\.(v\d+|json|xml|html|csv|pdf)$/i, "");
+    if (withoutExt.length > 2 && /[a-zA-Z]/.test(withoutExt)) {
+      return withoutExt;
+    }
+  }
+  return null;
+}
+
+function matchWsOperationBased(
+  url: string,
+  httpMethod: string | null,
+  candidates: GraphNode[]
+): GraphNode | null {
+  const opSegment = extractWsOperationSegment(url);
+  if (!opSegment) return null;
+
+  const opTokens = tokenize(opSegment);
+  if (opTokens.length === 0) return null;
+
+  const opTokenSet = new Set(opTokens);
+
+  let bestNode: GraphNode | null = null;
+  let bestScore = 0;
+
+  for (const node of candidates) {
+    const cleanedClass = node.className.replace(/(Controller|WsV\d+|ServiceV\d+|Ws)$/i, "");
+    const classTokens = tokenize(cleanedClass);
+    if (classTokens.length === 0) continue;
+
+    const classSet = new Set(classTokens);
+    let intersection = 0;
+    Array.from(opTokenSet).forEach((t) => {
+      if (classSet.has(t)) intersection++;
+    });
+
+    if (intersection === 0) continue;
+
+    let score: number;
+
+    if (intersection === opTokenSet.size && intersection === classSet.size) {
+      score = 100;
+    } else if (intersection === opTokenSet.size) {
+      score = 85;
+    } else if (intersection === classSet.size) {
+      score = 80;
+    } else {
+      const union = new Set(Array.from(opTokenSet).concat(classTokens)).size;
+      score = (intersection / union) * 70;
+    }
+
+    if (httpMethod) {
+      const meta = node.metadata as { httpMethod?: string };
+      if (meta.httpMethod && meta.httpMethod.toUpperCase() === httpMethod.toUpperCase()) {
+        score += 10;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestNode = node;
+    }
+  }
+
+  if (bestScore >= 50 && bestNode) {
+    console.log(`[MATCH][ws-operation] ${opSegment} -> ${bestNode.className}.${bestNode.methodName} (score: ${bestScore.toFixed(1)})`);
+    return bestNode;
+  }
+
+  return null;
+}
+
 function matchUrlToController(
   url: string,
   httpMethod: string | null,
   graph: ApplicationGraph,
-  stats: MatchStats
+  stats: MatchStats,
+  architectureType: ArchitectureType = "REST_CONTROLLER"
 ): GraphNode | null {
   const candidates = getControllerCandidates(graph);
   if (candidates.length === 0) return null;
+
+  if (architectureType === "WS_OPERATION_BASED") {
+    const wsMatch = matchWsOperationBased(url, httpMethod, candidates);
+    if (wsMatch) {
+      stats.byOperationName++;
+      return wsMatch;
+    }
+    stats.noMatch++;
+    return null;
+  }
 
   const byOpName = matchByOperationName(url, httpMethod, candidates);
   if (byOpName) {
@@ -574,7 +672,8 @@ export function interactionsToCatalogEntries(
   interactions: FrontendInteraction[],
   graph: ApplicationGraph,
   analysisRunId: number,
-  projectId: number
+  projectId: number,
+  architectureType: ArchitectureType = "REST_CONTROLLER"
 ): InsertCatalogEntry[] {
   const stats: MatchStats = {
     byOperationName: 0,
@@ -587,6 +686,7 @@ export function interactionsToCatalogEntries(
 
   const controllers = graph.getNodesByType("CONTROLLER");
   const validControllers = getControllerCandidates(graph);
+  console.log(`[graph-connector] Architecture type: ${architectureType}`);
   console.log(`[graph-connector] Controller nodes in graph: ${controllers.length} total, ${validControllers.length} valid (excluding health/ping)`);
   for (const c of validControllers.slice(0, 10)) {
     const meta = c.metadata as { httpMethod?: string; fullPath?: string };
@@ -610,7 +710,7 @@ export function interactionsToCatalogEntries(
 
     if (interaction.url) {
       stats.total++;
-      resolvedNode = matchUrlToController(interaction.url, interaction.httpMethod, graph, stats);
+      resolvedNode = matchUrlToController(interaction.url, interaction.httpMethod, graph, stats, architectureType);
     }
 
     if (resolvedNode) {
