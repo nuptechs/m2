@@ -21,6 +21,7 @@ const IGNORED_URL_PREFIXES = [
 ];
 
 interface MatchStats {
+  byOperationName: number;
   byMethodName: number;
   bySuffix: number;
   byStructural: number;
@@ -111,6 +112,128 @@ function matchByMethodName(
   }
 
   return methodOnlyMatch;
+}
+
+function tokenize(name: string): string[] {
+  return name
+    .replace(/[-_]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 1);
+}
+
+function matchByOperationName(
+  url: string,
+  httpMethod: string | null,
+  candidates: GraphNode[]
+): GraphNode | null {
+  const cleaned = url
+    .replace(/\?.*$/, "")
+    .replace(/\$\{[^}]+\}/g, "")
+    .replace(/`/g, "")
+    .replace(/\+\s*\w+/g, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "");
+
+  const segments = cleaned.split("/").filter(Boolean);
+
+  let operationSegment: string | null = null;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i];
+    if (seg.startsWith("{") || seg.startsWith(":") || /^\d+$/.test(seg)) continue;
+    operationSegment = seg;
+    break;
+  }
+
+  if (!operationSegment) return null;
+
+  const withoutExt = operationSegment
+    .replace(/\.(v\d+|json|xml|html|csv|pdf)$/i, "");
+
+  const opTokens = tokenize(withoutExt);
+  if (opTokens.length === 0) return null;
+
+  const opTokenSet = new Set(opTokens);
+
+  let bestNode: GraphNode | null = null;
+  let bestScore = 0;
+
+  for (const node of candidates) {
+    let nodeScore = 0;
+
+    if (node.methodName) {
+      const methodTokens = tokenize(node.methodName);
+      const methodSet = new Set(methodTokens);
+      let methodIntersection = 0;
+      Array.from(opTokenSet).forEach((t) => {
+        if (methodSet.has(t)) methodIntersection++;
+      });
+      if (methodIntersection > 0) {
+        const union = new Set(Array.from(opTokenSet).concat(methodTokens)).size;
+        const jaccardScore = (methodIntersection / union) * 100;
+        if (methodIntersection === opTokenSet.size && methodIntersection === methodSet.size) {
+          nodeScore = 100;
+        } else {
+          nodeScore = Math.max(nodeScore, jaccardScore);
+        }
+      }
+    }
+
+    if (nodeScore < 80) {
+      const sigTokens = node.qualifiedSignature
+        ? tokenize(node.qualifiedSignature.split("(")[0].split(".").pop() || "")
+        : [];
+      if (sigTokens.length > 0) {
+        const sigSet = new Set(sigTokens);
+        let sigIntersection = 0;
+        Array.from(opTokenSet).forEach((t) => {
+          if (sigSet.has(t)) sigIntersection++;
+        });
+        if (sigIntersection > 0) {
+          const union = new Set(Array.from(opTokenSet).concat(sigTokens)).size;
+          nodeScore = Math.max(nodeScore, (sigIntersection / union) * 90);
+        }
+      }
+    }
+
+    if (nodeScore < 60) {
+      const classTokens = tokenize(node.className.replace(/Controller$/i, ""));
+      if (classTokens.length > 0) {
+        const classSet = new Set(classTokens);
+        let classIntersection = 0;
+        Array.from(opTokenSet).forEach((t) => {
+          if (classSet.has(t)) classIntersection++;
+        });
+        if (classIntersection > 0) {
+          const union = new Set(Array.from(opTokenSet).concat(classTokens)).size;
+          nodeScore = Math.max(nodeScore, (classIntersection / union) * 50);
+        }
+      }
+    }
+
+    if (nodeScore === 0) continue;
+
+    if (httpMethod) {
+      const meta = node.metadata as { httpMethod?: string };
+      if (meta.httpMethod && meta.httpMethod.toUpperCase() === httpMethod.toUpperCase()) {
+        nodeScore += 10;
+      }
+    }
+
+    if (nodeScore > bestScore) {
+      bestScore = nodeScore;
+      bestNode = node;
+    }
+  }
+
+  if (bestScore >= 60 && bestNode) {
+    console.log(`[MATCH][operation] ${withoutExt} -> ${bestNode.className}.${bestNode.methodName} (score: ${bestScore.toFixed(1)})`);
+    return bestNode;
+  }
+
+  return null;
 }
 
 function stripKnownPrefixes(path: string): string {
@@ -297,6 +420,12 @@ function matchUrlToController(
   const candidates = getControllerCandidates(graph);
   if (candidates.length === 0) return null;
 
+  const byOpName = matchByOperationName(url, httpMethod, candidates);
+  if (byOpName) {
+    stats.byOperationName++;
+    return byOpName;
+  }
+
   const operationName = extractOperationName(url);
 
   if (operationName) {
@@ -440,6 +569,7 @@ export function interactionsToCatalogEntries(
   projectId: number
 ): InsertCatalogEntry[] {
   const stats: MatchStats = {
+    byOperationName: 0,
     byMethodName: 0,
     bySuffix: 0,
     byStructural: 0,
@@ -526,6 +656,7 @@ export function interactionsToCatalogEntries(
 
   console.log(`[graph-connector] === MATCHING SUMMARY ===`);
   console.log(`[graph-connector]   Interactions with URLs: ${stats.total}`);
+  console.log(`[graph-connector]   Matched by operation:   ${stats.byOperationName} (${stats.total ? Math.round(stats.byOperationName / stats.total * 100) : 0}%)`);
   console.log(`[graph-connector]   Matched by method name: ${stats.byMethodName} (${stats.total ? Math.round(stats.byMethodName / stats.total * 100) : 0}%)`);
   console.log(`[graph-connector]   Matched by suffix:      ${stats.bySuffix} (${stats.total ? Math.round(stats.bySuffix / stats.total * 100) : 0}%)`);
   console.log(`[graph-connector]   Matched by keyword:     ${stats.byStructural} (${stats.total ? Math.round(stats.byStructural / stats.total * 100) : 0}%)`);
