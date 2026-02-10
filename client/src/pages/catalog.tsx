@@ -31,7 +31,6 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import {
@@ -599,7 +598,7 @@ export default function CatalogPage() {
               )}
             </div>
           ) : (
-            <ScrollArea className="w-full">
+            <div className="w-full overflow-x-auto scrollbar-none">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -680,7 +679,7 @@ export default function CatalogPage() {
                   ))}
                 </TableBody>
               </Table>
-            </ScrollArea>
+            </div>
           )}
         </CardContent>
       </Card>
