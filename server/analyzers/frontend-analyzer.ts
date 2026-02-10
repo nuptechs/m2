@@ -3572,6 +3572,10 @@ function resolveBindingsViaNodes(
       for (const call of resolvedCalls) {
         const resolution: ResolutionMetadata | null = (call as any).__resolution || null;
         const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
+        let resPath = resolution?.resolutionPath || null;
+        if (backendNode && resPath) {
+          resPath = [...resPath, { tier: "controller", file: backendNode.className, function: backendNode.methodName, detail: `matched ${call.method} ${call.url}` }];
+        }
         interactions.push({
           component,
           elementType: binding.elementType,
@@ -3583,7 +3587,7 @@ function resolveBindingsViaNodes(
           lineNumber: binding.lineNumber,
           resolutionTier: resolution?.tier || null,
           resolutionStrategy: resolution?.tier || null,
-          resolutionPath: resolution?.resolutionPath || null,
+          resolutionPath: resPath,
           interactionCategory: "HTTP",
           confidence: tierToConfidence(resolution?.tier || null),
         });
@@ -3991,6 +3995,10 @@ function addUnmappedHttpCalls(
     const key = `${call.method}:${call.url}`;
     if (!mappedUrls.has(key)) {
       const backendNode = matchUrlToEndpoint(call.method, call.url, graph);
+      const unmappedPath: ResolutionStep[] = [{ tier: "local", file: filePath, function: call.callerFunction, detail: "unmapped direct HTTP call" }];
+      if (backendNode) {
+        unmappedPath.push({ tier: "controller", file: backendNode.className, function: backendNode.methodName, detail: `matched ${call.method} ${call.url}` });
+      }
       interactions.push({
         component,
         elementType: "http_call",
@@ -4002,7 +4010,7 @@ function addUnmappedHttpCalls(
         lineNumber: call.lineNumber,
         resolutionTier: "local",
         resolutionStrategy: "local",
-        resolutionPath: [{ tier: "local", file: filePath, function: call.callerFunction, detail: "unmapped direct HTTP call" }],
+        resolutionPath: unmappedPath,
         interactionCategory: "HTTP",
         confidence: 1.0,
       });
