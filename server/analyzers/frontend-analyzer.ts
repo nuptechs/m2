@@ -2706,6 +2706,261 @@ function lookupStateFlowGraph(
   return results;
 }
 
+type ArchitecturalRole = "component" | "facade" | "usecase" | "repository" | "unknown";
+
+interface ArchitecturalLayerGraph {
+  roleByFile: Map<string, ArchitecturalRole>;
+  importsByFile: Map<string, Set<string>>;
+  repositoryHttpCalls: Map<string, HttpCall[]>;
+}
+
+function classifyFileRole(
+  filePath: string,
+  content: string,
+  serviceMap: HttpServiceMap,
+  allFilePaths: string[]
+): ArchitecturalRole {
+  const ext = filePath.substring(filePath.lastIndexOf("."));
+
+  if (ext === ".vue") return "component";
+
+  const fileEntry = serviceMap.get(filePath);
+  const hasHttpCalls = fileEntry && (
+    fileEntry.directFunctions.size > 0 ||
+    Array.from(fileEntry.methods.values()).some(m => m.httpCalls.length > 0)
+  );
+
+  if (hasHttpCalls) return "repository";
+
+  if (![".ts", ".js", ".tsx", ".jsx"].includes(ext)) return "unknown";
+
+  try {
+    const scriptKind = (ext === ".tsx" || ext === ".jsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true, scriptKind);
+
+    let hasJSX = false;
+    let hasAngularComponent = false;
+    let exportedFunctionCount = 0;
+    let classCount = 0;
+    let importCount = 0;
+    let hasReturnJSX = false;
+
+    const walk = (node: ts.Node) => {
+      if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node)) {
+        hasJSX = true;
+      }
+      if (ts.isDecorator(node)) {
+        const text = node.getText(sourceFile);
+        if (text.includes("@Component") || text.includes("@NgModule")) {
+          hasAngularComponent = true;
+        }
+      }
+      if (ts.isClassDeclaration(node)) {
+        classCount++;
+      }
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+        const spec = node.moduleSpecifier.text;
+        if (spec.startsWith(".") || spec.startsWith("@/") || spec.startsWith("~/")) {
+          importCount++;
+        }
+      }
+      if (ts.isFunctionDeclaration(node) && node.name) {
+        if (node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+          exportedFunctionCount++;
+        }
+      }
+      if (ts.isVariableStatement(node)) {
+        if (node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+          for (const decl of node.declarationList.declarations) {
+            if (decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
+              exportedFunctionCount++;
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(sourceFile);
+
+    if (hasJSX || hasAngularComponent) return "component";
+
+    if (importCount === 0) return "unknown";
+
+    const lowerPath = filePath.toLowerCase();
+    const isRepoName = /\/(api|repository|client|service|http|request|resource)[\/\.\-]/i.test(lowerPath);
+    const isFacadeName = /\/(facade|gateway|mediator|orchestrator|proxy)[\/\.\-]/i.test(lowerPath);
+    const isUseCaseName = /\/(usecase|use-case|interactor|handler|command|action|business)[\/\.\-]/i.test(lowerPath);
+
+    if (isRepoName && !hasHttpCalls) return "usecase";
+    if (isFacadeName) return "facade";
+    if (isUseCaseName) return "usecase";
+
+    if (exportedFunctionCount > 0 && importCount >= 2 && classCount === 0) {
+      return "facade";
+    }
+    if (classCount > 0 && importCount >= 2) {
+      return "usecase";
+    }
+    if (exportedFunctionCount > 0 && importCount >= 1) {
+      return "facade";
+    }
+
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function buildArchitecturalLayerGraph(
+  files: { filePath: string; content: string }[],
+  serviceMap: HttpServiceMap,
+  allFilePaths: string[]
+): ArchitecturalLayerGraph {
+  const roleByFile = new Map<string, ArchitecturalRole>();
+  const importsByFile = new Map<string, Set<string>>();
+  const repositoryHttpCalls = new Map<string, HttpCall[]>();
+
+  for (const file of files) {
+    if (file.filePath.includes("node_modules") || file.filePath.includes("dist/") || file.filePath.includes("build/")) {
+      continue;
+    }
+    const ext = file.filePath.substring(file.filePath.lastIndexOf("."));
+    if (![".ts", ".js", ".tsx", ".jsx", ".vue"].includes(ext)) continue;
+
+    const role = classifyFileRole(file.filePath, file.content, serviceMap, allFilePaths);
+    roleByFile.set(file.filePath, role);
+
+    if (role === "repository") {
+      const allCalls: HttpCall[] = [];
+      const fileEntry = serviceMap.get(file.filePath);
+      if (fileEntry) {
+        for (const calls of Array.from(fileEntry.directFunctions.values())) {
+          allCalls.push(...calls);
+        }
+        for (const entry of Array.from(fileEntry.methods.values())) {
+          allCalls.push(...entry.httpCalls);
+        }
+      }
+      if (allCalls.length > 0) {
+        repositoryHttpCalls.set(file.filePath, allCalls);
+      }
+    }
+
+    try {
+      let scriptContent = file.content;
+      if (ext === ".vue") {
+        scriptContent = extractVueScript(file.content);
+      }
+      if (!scriptContent.trim()) continue;
+
+      const scriptKind = (ext === ".tsx" || ext === ".jsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+      const sourceFile = ts.createSourceFile(file.filePath + ".arch.ts", scriptContent, ts.ScriptTarget.Latest, true, scriptKind);
+      const imports = new Set<string>();
+
+      const visit = (node: ts.Node) => {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+          const resolved = normalizeModulePath(file.filePath, node.moduleSpecifier.text, allFilePaths);
+          if (resolved) {
+            imports.add(resolved);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+
+      if (imports.size > 0) {
+        importsByFile.set(file.filePath, imports);
+      }
+    } catch {
+    }
+  }
+
+  const roleStats = { component: 0, facade: 0, usecase: 0, repository: 0, unknown: 0 };
+  for (const role of Array.from(roleByFile.values())) {
+    roleStats[role]++;
+  }
+  console.log(`[arch-layer] Built: ${roleByFile.size} files classified — ${roleStats.component} components, ${roleStats.facade} facades, ${roleStats.usecase} usecases, ${roleStats.repository} repositories, ${roleStats.unknown} unknown`);
+
+  return { roleByFile, importsByFile, repositoryHttpCalls };
+}
+
+function lookupArchitecturalLayerGraph(
+  archGraph: ArchitecturalLayerGraph,
+  filePath: string,
+  handlerName: string,
+  importBindings?: Map<string, ImportBinding>
+): HttpCall[] {
+  const fileRole = archGraph.roleByFile.get(filePath);
+  if (fileRole !== "component") return [];
+
+  if (!importBindings || importBindings.size === 0) return [];
+
+  const roleOrder: ArchitecturalRole[] = ["component", "facade", "usecase", "repository"];
+
+  const results: HttpCall[] = [];
+  const seen = new Set<string>();
+  const visitedFiles = new Set<string>();
+  visitedFiles.add(filePath);
+
+  function traverse(currentFile: string, currentRoleIdx: number, depth: number): void {
+    if (depth > 3 || visitedFiles.has(currentFile)) return;
+    visitedFiles.add(currentFile);
+
+    const currentRole = archGraph.roleByFile.get(currentFile);
+    if (!currentRole) return;
+    const currentIdx = roleOrder.indexOf(currentRole);
+    if (currentIdx < 0) return;
+
+    if (currentIdx < currentRoleIdx) return;
+
+    if (currentRole === "repository") {
+      const httpCalls = archGraph.repositoryHttpCalls.get(currentFile);
+      if (httpCalls) {
+        for (const call of httpCalls) {
+          const key = `${call.method}:${call.url}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push(call);
+          }
+        }
+      }
+      return;
+    }
+
+    const imports = archGraph.importsByFile.get(currentFile);
+    if (!imports) return;
+
+    for (const importedFile of Array.from(imports)) {
+      if (visitedFiles.has(importedFile)) continue;
+
+      const importedRole = archGraph.roleByFile.get(importedFile);
+      if (!importedRole || importedRole === "component" || importedRole === "unknown") continue;
+
+      const importedRoleIdx = roleOrder.indexOf(importedRole);
+      if (importedRoleIdx < 0) continue;
+
+      if (importedRoleIdx >= currentIdx) {
+        traverse(importedFile, currentIdx, depth + 1);
+      }
+    }
+  }
+
+  for (const [localName, binding] of Array.from(importBindings.entries())) {
+    const importedFile = binding.sourcePath;
+    if (visitedFiles.has(importedFile)) continue;
+
+    const importedRole = archGraph.roleByFile.get(importedFile);
+    if (!importedRole || importedRole === "component" || importedRole === "unknown") continue;
+
+    const importedRoleIdx = roleOrder.indexOf(importedRole);
+    if (importedRoleIdx < 0) continue;
+
+    traverse(importedFile, importedRoleIdx, 1);
+  }
+
+  return results;
+}
+
 function lookupEventGraph(
   eventGraph: ComponentEventGraph,
   handlerName: string,
@@ -3237,7 +3492,8 @@ function resolveBindingsViaNodes(
   allFiles?: { filePath: string; content: string }[],
   serviceMap?: HttpServiceMap,
   allFilePaths?: string[],
-  stateFlowGraph?: StateFlowGraph
+  stateFlowGraph?: StateFlowGraph,
+  archLayerGraph?: ArchitecturalLayerGraph
 ): FrontendInteraction[] {
   const interactions: FrontendInteraction[] = [];
 
@@ -3262,7 +3518,7 @@ function resolveBindingsViaNodes(
       binding.handlerName, symbolTable, filePath, graph,
       externalCalls, crossFileContext, globalCallGraph,
       eventGraph, allFiles, serviceMap, allFilePaths,
-      stateFlowGraph
+      stateFlowGraph, archLayerGraph
     );
 
     if (resolvedCalls.length > 0) {
@@ -3308,7 +3564,8 @@ function resolveHandlerHttpCalls(
   allFiles?: { filePath: string; content: string }[],
   serviceMap?: HttpServiceMap,
   allFilePaths?: string[],
-  stateFlowGraph?: StateFlowGraph
+  stateFlowGraph?: StateFlowGraph,
+  archLayerGraph?: ArchitecturalLayerGraph
 ): HttpCall[] {
   const handlerNode = symbolTable.resolveHandlerNode(handlerName);
 
@@ -3391,6 +3648,12 @@ function resolveHandlerHttpCalls(
     if (stateCalls.length > 0) return stateCalls;
   }
 
+  if (archLayerGraph && false) {
+    const importBindings = crossFileContext?.importBindings;
+    const archCalls = lookupArchitecturalLayerGraph(archLayerGraph, filePath, handlerName, importBindings);
+    if (archCalls.length > 0) return archCalls;
+  }
+
   return [];
 }
 
@@ -3403,7 +3666,8 @@ function analyzeVueFile(
   globalCallGraph?: GlobalCallGraph,
   eventGraph?: ComponentEventGraph,
   allFiles?: { filePath: string; content: string }[],
-  stateFlowGraph?: StateFlowGraph
+  stateFlowGraph?: StateFlowGraph,
+  archLayerGraph?: ArchitecturalLayerGraph
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const { bindings: templateBindings, scriptContent } = parseVueTemplateAST(content);
@@ -3424,7 +3688,7 @@ function analyzeVueFile(
   }
 
   const interactions = symbolTable
-    ? resolveBindingsViaNodes(templateBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph)
+    ? resolveBindingsViaNodes(templateBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph, archLayerGraph)
     : templateBindings.map(b => ({
         component,
         elementType: b.elementType,
@@ -3450,7 +3714,8 @@ function analyzeReactFile(
   globalCallGraph?: GlobalCallGraph,
   eventGraph?: ComponentEventGraph,
   allFiles?: { filePath: string; content: string }[],
-  stateFlowGraph?: StateFlowGraph
+  stateFlowGraph?: StateFlowGraph,
+  archLayerGraph?: ArchitecturalLayerGraph
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const sourceFile = parseTypeScript(content, filePath);
@@ -3465,7 +3730,7 @@ function analyzeReactFile(
   }
 
   const interactions = resolveBindingsViaNodes(
-    jsxBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph
+    jsxBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph, archLayerGraph
   );
 
   addUnmappedHttpCalls(interactions, allHttpCalls, component, filePath, graph);
@@ -3483,7 +3748,8 @@ function analyzeAngularFile(
   globalCallGraph?: GlobalCallGraph,
   eventGraph?: ComponentEventGraph,
   allFiles?: { filePath: string; content: string }[],
-  stateFlowGraph?: StateFlowGraph
+  stateFlowGraph?: StateFlowGraph,
+  archLayerGraph?: ArchitecturalLayerGraph
 ): FrontendInteraction[] {
   const component = getComponentName(filePath);
   const interactions: FrontendInteraction[] = [];
@@ -3540,7 +3806,7 @@ function analyzeAngularFile(
   if (templateContent) {
     const templateBindings = parseAngularTemplateAST(templateContent);
     const resolved = resolveBindingsViaNodes(
-      templateBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph
+      templateBindings, symbolTable, component, filePath, graph, crossFileContext, globalCallGraph, eventGraph, allFiles, serviceMap, allFilePaths, stateFlowGraph, archLayerGraph
     );
     interactions.push(...resolved);
   }
@@ -3648,6 +3914,7 @@ export function analyzeFrontend(
   const allFilePaths = files.map(f => f.filePath);
   const eventGraph = buildComponentEventGraph(files, allFilePaths);
   const stateFlowGraph = buildStateFlowGraph(files, serviceMap, globalCallGraph);
+  const archLayerGraph = buildArchitecturalLayerGraph(files, serviceMap, allFilePaths);
 
   for (const file of files) {
     if (file.filePath.endsWith(".html")) {
@@ -3666,18 +3933,18 @@ export function analyzeFrontend(
     try {
       switch (fileType) {
         case "vue":
-          interactions.push(...analyzeVueFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph));
+          interactions.push(...analyzeVueFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph, archLayerGraph));
           break;
 
         case "react":
-          interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph));
+          interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph, archLayerGraph));
           break;
 
         case "javascript":
           if (isAngularComponent(file.content)) {
-            interactions.push(...analyzeAngularFile(file.filePath, file.content, graph, htmlTemplates, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph));
+            interactions.push(...analyzeAngularFile(file.filePath, file.content, graph, htmlTemplates, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph, archLayerGraph));
           } else {
-            interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph));
+            interactions.push(...analyzeReactFile(file.filePath, file.content, graph, serviceMap, allFilePaths, globalCallGraph, eventGraph, files, stateFlowGraph, archLayerGraph));
           }
           break;
 

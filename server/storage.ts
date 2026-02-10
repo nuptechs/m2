@@ -135,7 +135,14 @@ export class DatabaseStorage implements IStorage {
 
   async createCatalogEntries(entries: InsertCatalogEntry[]): Promise<CatalogEntry[]> {
     if (entries.length === 0) return [];
-    return db.insert(catalogEntries).values(entries).returning();
+    const BATCH_SIZE = 500;
+    const results: CatalogEntry[] = [];
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      const created = await db.insert(catalogEntries).values(batch).returning();
+      results.push(...created);
+    }
+    return results;
   }
 
   async updateCatalogEntry(id: number, data: Partial<CatalogEntry>): Promise<void> {

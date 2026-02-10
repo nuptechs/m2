@@ -1,0 +1,135 @@
+You are not adding another call graph.
+
+You are adding the Architectural Layer Graph — the missing piece that allows the analyzer to generalize to any enterprise codebase without relying on direct call chains.
+
+The Problem
+
+The current analyzer resolves HTTP calls through:
+
+Local tracing
+
+Cross-file service map
+
+Global call graph
+
+Component event graph
+
+State flow graph
+
+These handle execution flow.
+
+But they do not handle architectural responsibility flow.
+
+In real systems, handlers often call:
+
+Component → Facade → UseCase → Repository → HTTP
+
+Without:
+
+direct HTTP imports
+
+direct calls across layers
+
+emits
+
+shared state
+
+Yet humans can resolve this instantly because the layers define predictable dependencies.
+
+Your task
+
+Implement a sixth-tier resolver called:
+
+Architectural Layer Graph
+
+This graph does not track calls.
+It tracks file roles and allowed dependency directions.
+
+Step 1 — Detect file role (no heuristics based on names only)
+
+For every file, classify its architectural role using AST patterns:
+
+Component
+
+.vue, .tsx, .jsx, Angular components
+
+Facade / Service layer
+
+files exporting plain functions that orchestrate calls to other modules
+
+no HTTP inside
+
+no UI code
+
+UseCase / Business layer
+
+classes or modules coordinating repositories
+
+Repository / API layer
+
+files that contain HTTP calls
+
+Store this in:
+
+interface ArchitecturalRoleRegistry {
+  filePath: string;
+  role: 'component' | 'facade' | 'usecase' | 'repository';
+}
+
+Step 2 — Build Architectural Layer Graph
+
+This is NOT a call graph.
+
+It is a role dependency graph:
+
+component -> facade
+facade -> usecase
+usecase -> repository
+repository -> http
+
+Step 3 — 6th Tier Resolution
+
+In resolveHandlerHttpCalls, before returning [], add:
+
+lookupArchitecturalLayerGraph(filePath, handlerName)
+
+
+Logic:
+
+If handler is in a component
+
+Find which facade files it imports
+
+From facade, find which usecases it imports
+
+From usecase, find which repositories it imports
+
+From repository, extract HTTP calls
+
+Propagate back to the handler
+
+This must work even when:
+
+there is no direct call chain
+
+only layered imports
+
+Important
+
+This must be based on:
+
+import graph
+
+architectural role
+
+Not function call tracing.
+
+Expected Result
+
+This enables resolution of enterprise patterns like:
+
+Component → Facade → UseCase → Repository → HTTP
+
+Which the previous 5 tiers cannot detect.
+
+This is the final piece that makes the analyzer general-purpose and near-perfect.
