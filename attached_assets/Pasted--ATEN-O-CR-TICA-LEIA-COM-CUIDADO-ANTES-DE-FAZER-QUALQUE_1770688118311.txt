@@ -1,0 +1,149 @@
+⚠️ ATENÇÃO CRÍTICA — LEIA COM CUIDADO ANTES DE FAZER QUALQUER COISA
+
+O frontend analyzer, service map, call graph, event graph, state graph e architectural graph já estão funcionando corretamente.
+NÃO TOQUE EM NADA DISSO.
+
+NÃO refatore.
+NÃO otimize.
+NÃO mude lógica.
+NÃO altere resolução.
+NÃO mexa em nenhuma função existente.
+
+O problema não está no analisador.
+O problema está no modelo do catálogo que está pobre demais para representar o que o analisador já sabe.
+
+Sua tarefa NÃO é mexer no motor.
+Sua tarefa é evoluir exclusivamente o modelo de dados do catálogo e a forma como o resultado é persistido.
+
+🎯 OBJETIVO
+
+O catálogo hoje armazena apenas:
+
+interaction
+
+interactionType
+
+suggestedMeaning
+
+endpoint
+
+controllerClass
+
+Isso descarta 90% da informação que o analisador já descobriu.
+
+Precisamos transformar o catálogo em algo que represente:
+
+COMO o endpoint foi resolvido
+
+QUAL estratégia/tier funcionou
+
+QUAL foi o caminho de resolução (resolution path)
+
+QUAL a arquitetura detectada do projeto
+
+DIFERENCIAR interações HTTP de interações puramente de UI/estado
+
+Permitir auditoria, explicabilidade e métricas reais do analisador
+
+❗ RESTRIÇÕES ABSOLUTAS
+
+Você está PROIBIDO de:
+
+Alterar qualquer lógica de resolução
+
+Alterar qualquer função do analyzer
+
+Refatorar arquivos existentes
+
+Mudar nomes de funções
+
+Mexer em HttpServiceMap, CallGraph, EventGraph, StateGraph, ArchGraph
+
+Você pode APENAS:
+
+Criar novos tipos/interfaces
+
+Alterar o schema do catálogo
+
+Alterar a montagem do objeto CatalogEntry no graph-connector
+
+Adicionar campos novos no momento da persistência
+
+🧩 O QUE O NOVO CATÁLOGO DEVE REPRESENTAR
+
+Cada entrada deve passar a conter no mínimo:
+
+1. resolutionPath (array ordenado)
+
+Lista detalhada do caminho que levou do handler até o endpoint.
+
+Exemplo conceitual:
+
+resolutionPath: [
+  { tier: "local", file: "Companies.vue", function: "handleSubmit" },
+  { tier: "serviceMap", file: "companies.ts", function: "companiesApi.create" },
+  { tier: "inheritance", file: "base-api.ts", function: "BaseApiService.create" },
+  { tier: "urlResolution", pattern: "{base}/create" },
+  { tier: "architectureMatch", strategy: "WS_OPERATION_BASED" }
+]
+
+2. resolutionStrategy
+
+String resumindo quais tiers participaram, por exemplo:
+
+"tier2+tier3+tier6"
+
+3. architectureType
+
+REST_CONTROLLER ou WS_OPERATION_BASED
+
+4. interactionCategory
+
+Um enum:
+
+HTTP
+
+UI_ONLY
+
+STATE_ONLY
+
+Entradas com endpoint null NÃO são erro — são UI_ONLY ou STATE_ONLY.
+
+5. confidence (0–1)
+
+Baseado na estratégia usada (tiers mais profundos = menor confiança relativa)
+
+🛠️ ONDE IMPLEMENTAR
+
+Tipos novos no arquivo de tipos do catálogo
+
+Atualização do schema de persistência
+
+Atualização APENAS do ponto onde o CatalogEntry é criado no graph-connector
+
+O analyzer já possui todas as informações necessárias.
+Você só precisa propagar essa informação para o catálogo.
+
+🚨 MUITO IMPORTANTE
+
+Se em algum momento você achar que “precisa mexer no analyzer”, você está fazendo errado.
+
+Pare.
+
+O analyzer NÃO precisa ser tocado.
+
+RESULTADO ESPERADO
+
+Um catálogo que permita:
+
+Explicar exatamente como cada endpoint foi descoberto
+
+Diferenciar UI de HTTP real
+
+Medir qualidade do analyzer
+
+Suportar qualquer tipo de arquitetura futura
+
+Sem alterar uma única linha da lógica de análise.
+
+Confirme o plano antes de escrever código.
