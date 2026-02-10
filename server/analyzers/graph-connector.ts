@@ -418,7 +418,7 @@ function resolveGatewayOperations(entries: InsertCatalogEntry[], graph: Applicat
 
   const GATEWAY_THRESHOLD = 5;
   const gatewayEndpoints = new Set<string>();
-  for (const [ep, count] of endpointFanIn) {
+  for (const [ep, count] of Array.from(endpointFanIn.entries())) {
     if (count >= GATEWAY_THRESHOLD) {
       gatewayEndpoints.add(ep);
     }
@@ -427,7 +427,7 @@ function resolveGatewayOperations(entries: InsertCatalogEntry[], graph: Applicat
   if (gatewayEndpoints.size === 0) return entries;
 
   console.log(`[graph-connector] Gateway detection: ${gatewayEndpoints.size} concentrator endpoint(s) found (${GATEWAY_THRESHOLD}+ references)`);
-  for (const ep of gatewayEndpoints) {
+  for (const ep of Array.from(gatewayEndpoints)) {
     console.log(`[graph-connector]   Gateway endpoint: ${ep} (${endpointFanIn.get(ep)} references)`);
   }
 
@@ -449,21 +449,24 @@ function resolveGatewayOperations(entries: InsertCatalogEntry[], graph: Applicat
     if (!hint) return entry;
 
     const normalizedHint = hint.replace(/\./g, "").replace(/[-_]/g, "").replace(/v\d+$/i, "").toLowerCase();
+    const MIN_SUBSTRING_MATCH_LEN = 6;
 
     let matchedNode: GraphNode | null = null;
     let bestMatchLen = 0;
+    let exactMatch = false;
 
-    for (const [key, node] of controllerIndex) {
+    for (const [key, node] of Array.from(controllerIndex.entries())) {
       const normalizedKey = key.replace(/[-_]/g, "").toLowerCase();
       if (normalizedHint === normalizedKey) {
         matchedNode = node;
+        exactMatch = true;
         break;
       }
-      if (normalizedHint.includes(normalizedKey) && normalizedKey.length > bestMatchLen) {
+      if (normalizedHint.includes(normalizedKey) && normalizedKey.length >= MIN_SUBSTRING_MATCH_LEN && normalizedKey.length > bestMatchLen) {
         matchedNode = node;
         bestMatchLen = normalizedKey.length;
       }
-      if (normalizedKey.includes(normalizedHint) && normalizedHint.length > 3 && normalizedHint.length > bestMatchLen) {
+      if (normalizedKey.includes(normalizedHint) && normalizedHint.length >= MIN_SUBSTRING_MATCH_LEN && normalizedHint.length > bestMatchLen) {
         matchedNode = node;
         bestMatchLen = normalizedHint.length;
       }
@@ -483,7 +486,7 @@ function resolveGatewayOperations(entries: InsertCatalogEntry[], graph: Applicat
       const technicalOperation = inferOperationType(
         chain.serviceMethods,
         chain.repositoryMethods,
-        entry.httpMethod,
+        entry.httpMethod || null,
         chain.persistenceOperations
       );
 

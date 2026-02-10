@@ -623,7 +623,7 @@ public class JavaASTAnalyzer {
     }
 
     private static final Set<String> SECURITY_CHECK_METHODS = Set.of(
-        "isUserInRole", "hasRole", "hasAuthority", "hasPermission", "hasAccess",
+        "hasRole", "hasAuthority", "hasPermission", "hasAccess",
         "checkPermission", "checkAccess", "authorize", "isAllowed", "isAuthorized",
         "isAuthenticated", "checkRole", "validatePermission", "verifyPermission",
         "requireRole", "requirePermission", "requireAuth", "requireAuthentication"

@@ -3408,9 +3408,9 @@ function extractUrlFromNode(node: ts.Node): string | null {
 }
 
 const OPERATION_HINT_FIELDS = new Set([
-  "service", "action", "command", "operation", "type", "query", "method",
+  "service", "action", "command", "operation",
   "operationName", "serviceName", "actionName", "commandName", "queryName",
-  "rpc", "endpoint", "handler", "procedure", "topic",
+  "rpc", "handler", "procedure", "topic", "operationType", "serviceAction",
 ]);
 
 function extractOperationHint(
