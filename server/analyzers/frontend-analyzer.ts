@@ -2888,22 +2888,54 @@ function lookupArchitecturalLayerGraph(
   archGraph: ArchitecturalLayerGraph,
   filePath: string,
   handlerName: string,
+  symbolTable: ScriptSymbolTable,
+  externalCalls: ExternalCall[] | null,
   importBindings?: Map<string, ImportBinding>
 ): HttpCall[] {
-  const fileRole = archGraph.roleByFile.get(filePath);
-  if (fileRole !== "component") return [];
+  if (!externalCalls || !importBindings || importBindings.size === 0) return [];
 
-  if (!importBindings || importBindings.size === 0) return [];
+  const relevantFunctions = new Set<string>([handlerName]);
+  const handlerNode = symbolTable.resolveHandlerNode(handlerName);
+  if (handlerNode) {
+    const visited = new Set<ts.Node>();
+    const collectCalled = (node: ts.Node) => {
+      if (visited.has(node)) return;
+      visited.add(node);
+      const decl = symbolTable.getDeclaration(node);
+      if (decl && decl.name) {
+        relevantFunctions.add(decl.name);
+        for (const calledNode of decl.calledNodes) {
+          collectCalled(calledNode);
+        }
+      }
+    };
+    collectCalled(handlerNode);
+  }
+
+  const handlerExternalCalls = externalCalls.filter(
+    ec => relevantFunctions.has(ec.callerFunction)
+  );
+  if (handlerExternalCalls.length === 0) return [];
+
+  const targetFiles = new Set<string>();
+  for (const ec of handlerExternalCalls) {
+    const binding = importBindings.get(ec.importedName);
+    if (binding) {
+      targetFiles.add(binding.sourcePath);
+    }
+  }
+  if (targetFiles.size === 0) return [];
 
   const roleOrder: ArchitecturalRole[] = ["component", "facade", "usecase", "repository"];
 
   const results: HttpCall[] = [];
   const seen = new Set<string>();
-  const visitedFiles = new Set<string>();
-  visitedFiles.add(filePath);
 
-  function traverse(currentFile: string, currentRoleIdx: number, depth: number): void {
-    if (depth > 3 || visitedFiles.has(currentFile)) return;
+  const traverseArch = (
+    currentFile: string, minRoleIdx: number, depth: number,
+    visitedFiles: Set<string>
+  ): void => {
+    if (depth > 4 || visitedFiles.has(currentFile)) return;
     visitedFiles.add(currentFile);
 
     const currentRole = archGraph.roleByFile.get(currentFile);
@@ -2911,7 +2943,7 @@ function lookupArchitecturalLayerGraph(
     const currentIdx = roleOrder.indexOf(currentRole);
     if (currentIdx < 0) return;
 
-    if (currentIdx < currentRoleIdx) return;
+    if (currentIdx < minRoleIdx) return;
 
     if (currentRole === "repository") {
       const httpCalls = archGraph.repositoryHttpCalls.get(currentFile);
@@ -2940,22 +2972,20 @@ function lookupArchitecturalLayerGraph(
       if (importedRoleIdx < 0) continue;
 
       if (importedRoleIdx >= currentIdx) {
-        traverse(importedFile, currentIdx, depth + 1);
+        traverseArch(importedFile, currentIdx, depth + 1, visitedFiles);
       }
     }
-  }
+  };
 
-  for (const [localName, binding] of Array.from(importBindings.entries())) {
-    const importedFile = binding.sourcePath;
-    if (visitedFiles.has(importedFile)) continue;
+  for (const targetFile of Array.from(targetFiles)) {
+    const targetRole = archGraph.roleByFile.get(targetFile);
+    if (!targetRole || targetRole === "component" || targetRole === "unknown") continue;
 
-    const importedRole = archGraph.roleByFile.get(importedFile);
-    if (!importedRole || importedRole === "component" || importedRole === "unknown") continue;
+    const visitedFiles = new Set<string>();
+    visitedFiles.add(filePath);
 
-    const importedRoleIdx = roleOrder.indexOf(importedRole);
-    if (importedRoleIdx < 0) continue;
-
-    traverse(importedFile, importedRoleIdx, 1);
+    const targetRoleIdx = roleOrder.indexOf(targetRole);
+    traverseArch(targetFile, targetRoleIdx, 1, visitedFiles);
   }
 
   return results;
@@ -3648,9 +3678,9 @@ function resolveHandlerHttpCalls(
     if (stateCalls.length > 0) return stateCalls;
   }
 
-  if (archLayerGraph && false) {
+  if (archLayerGraph) {
     const importBindings = crossFileContext?.importBindings;
-    const archCalls = lookupArchitecturalLayerGraph(archLayerGraph, filePath, handlerName, importBindings);
+    const archCalls = lookupArchitecturalLayerGraph(archLayerGraph, filePath, handlerName, symbolTable, externalCalls, importBindings);
     if (archCalls.length > 0) return archCalls;
   }
 

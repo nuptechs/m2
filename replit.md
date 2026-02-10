@@ -11,7 +11,22 @@ The application features a frontend built with React, TypeScript, Shadcn UI, and
 
 Key features include ZIP repository upload for automatic scanning, individual file uploads, AST-based parsing of frontend interaction points and Java backend components (controllers, services, repositories, entities), and building a graph connecting frontend interactions to backend endpoints with full method tracing. The system supports backend-only catalog generation, an editable catalog with human classification support, and JSON export.
 
-The Java Backend Analyzer uses JavaParser with JavaSymbolSolver for semantic AST analysis. The Frontend Analyzer, built in Node.js, uses framework-specific AST parsers to resolve handlers, trace HTTP calls, and identify HTTP client identifiers. It implements a multi-pass architecture for robust cross-file HTTP service resolution, local variable URL tracing, and global function call graph analysis. Advanced resolution mechanisms include a Component Event Graph for propagating HTTP resolution through component event boundaries and a State Flow Graph for tracing HTTP calls through state management systems (Pinia, Vuex, Redux, Angular services). An Architectural Layer Graph is also present but disabled due to over-resolution issues.
+The Java Backend Analyzer uses JavaParser with JavaSymbolSolver for semantic AST analysis. The Frontend Analyzer, built in Node.js, uses framework-specific AST parsers to resolve handlers, trace HTTP calls, and identify HTTP client identifiers. It implements a multi-pass architecture for robust cross-file HTTP service resolution, local variable URL tracing, and global function call graph analysis. Advanced resolution mechanisms include a Component Event Graph for propagating HTTP resolution through component event boundaries, a State Flow Graph for tracing HTTP calls through state management systems (Pinia, Vuex, Redux, Angular services), and an Architectural Layer Graph for symbol-first architectural traversal (handler → resolved symbol → owning file → architectural climb via imports to repositories).
+
+### Six-Tier HTTP Resolution System (resolveHandlerHttpCalls)
+1. **Local HTTP Calls**: Direct HTTP calls in handler via ScriptSymbolTable.traceHttpCalls
+2. **External Calls**: Imported functions resolved via importBindings + HttpServiceMap
+3. **Global Call Graph**: Cross-file function call propagation with HTTP call inheritance
+4. **Event Graph**: Parent component event handlers traced for HTTP calls
+5. **State Flow Graph**: State write→read chains connecting handlers to HTTP-calling functions
+6. **Architectural Layer Graph**: Symbol-first approach — handler's called symbols → resolve via importBindings to target file → classify role (facade/usecase/repository) → climb import chain following role constraints → collect repository HTTP calls. Key rule: architectural traversal ONLY after concrete symbol target is known.
+
+### Architectural Layer Graph (Sixth-Tier Resolution) — ACTIVE (symbol-first)
+- **Correct algorithm**: handler → external calls filtered by handler scope (relevantFunctions) → resolve each imported name to sourcePath via importBindings → one specific target file → climb from there following role constraints
+- **Previous failed attempt**: Used file-level imports (ALL imports) → 7x over-resolution. Fixed by switching to symbol-first approach.
+- **Data structures**: `ArchitecturalLayerGraph { roleByFile, importsByFile, repositoryHttpCalls }`
+- **Role classification** (`classifyFileRole`): .vue→component, HTTP calls in serviceMap→repository, @Component/defineComponent/JSX→component, @Injectable/@Service→facade, class declarations→usecase, else→unknown
+- **Validated on easynup**: 2444 total entries, 1017 with endpoints, 685 with controllers, 317 {base} URLs (near-zero false positives, +3 genuine new resolutions vs baseline)
 
 The system constructs an in-memory Application Graph model, representing backend components and their interactions, enabling detailed traversal and impact analysis. Data flow involves source file analysis by both Java and Node.js engines, graph reconstruction, and conversion into catalog entries. A deterministic classifier assigns `technicalOperation`, `criticalityScore`, and `suggestedMeaning`, with optional LLM enrichment. A robust repository scanner handles large ZIP files efficiently. Database inserts for catalog entries are batched to prevent performance issues with large result sets.
 
