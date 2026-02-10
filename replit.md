@@ -54,10 +54,53 @@ Each catalog entry now carries full resolution metadata directly from the analyz
 - **architectureType** (text): "REST_CONTROLLER" or "WS_OPERATION_BASED"
 - **interactionCategory** (text): "HTTP", "UI_ONLY", or "STATE_ONLY" — entries with null endpoint are UI_ONLY, not errors
 - **confidence** (real, 0–1): Computed in graph-connector from structural quality of resolutionPath — NOT from analyzer tier. Scoring criteria: base 0.3, +0.35 if controller resolved, +0.2 if repository methods found, +0.05–0.15 based on hop count (1 hop best). Capped at 1.0.
+- **requiredRoles** (jsonb, string[]): Roles extracted from Spring Security annotations (@PreAuthorize, @Secured, @RolesAllowed) on controller/service methods. Propagated through walkCallChain — both class-level and method-level annotations are merged.
+- **securityAnnotations** (jsonb, {type, expression, roles}[]): Raw security annotation data from Java backend. Includes annotation type, SpEL expression, and parsed role list. Supports: hasRole(), hasAuthority(), hasAnyRole(), hasAnyAuthority(), @Secured, @RolesAllowed, @DenyAll, @PermitAll.
+- **entityFieldsMetadata** (jsonb): Enriched JPA entity field data: { entity, fields: [{name, type, isId, isSensitive, validations}] }. Validation annotations (@NotNull, @Size, @Email, @Pattern, etc.) are captured. Sensitive field detection uses keyword matching + @JsonIgnore/@JsonProperty(access=WRITE_ONLY).
+- **sensitiveFieldsAccessed** (jsonb, string[]): List of sensitive fields (password, token, apiKey, ssn, salary, etc.) touched in the call chain. Format: "EntityName.fieldName".
+- **frontendRoute** (text): The page route where the interaction's component is mounted, extracted from Vue Router / React Router / Angular Router definitions.
+- **routeGuards** (jsonb, string[]): Route-level guards (beforeEnter, canActivate, meta.requiresAuth) + handler-level security patterns detected in frontend code (hasRole checks, permission comparisons, auth checks).
 
 **Design principle**: `resolutionStrategy` was intentionally removed — it leaked analyzer internals (tier names like "serviceMap", "architecturalLayerGraph") into the catalog model, creating incorrect coupling. The catalog should be agnostic to the analyzer's internal resolution mechanism. Only the `resolutionPath` (structural truth) is persisted. Confidence is derived from the path's structural quality, not from which tier discovered it.
 
 Resolution metadata is attached via `__resolution` property on `HttpCall[]` arrays inside `resolveHandlerHttpCalls`, read in `resolveBindingsViaNodes`, stored in `FrontendInteraction`, and persisted to the catalog by graph-connector. The analyzer functions themselves are unchanged — only the data propagation was added.
+
+### Spring Security Annotation Extraction (Java Analyzer)
+- Class-level and method-level annotations detected: @PreAuthorize, @PostAuthorize, @Secured, @RolesAllowed, @DenyAll, @PermitAll
+- SpEL expression parsing: hasRole(), hasAuthority(), hasAnyRole(), hasAnyAuthority() with role extraction
+- Annotations stored in ClassInfo.securityAnnotations and MethodInfo.securityAnnotations
+- Both class-level and method-level annotations merged when building graph nodes
+- SecurityAnnotation record: {type, expression, roles}
+
+### JPA Entity Field Enrichment (Java Analyzer)
+- EntityField now includes: name, type, isId, isSensitive, validationAnnotations
+- Validation annotations detected: @NotNull, @NotBlank, @NotEmpty, @Size, @Min, @Max, @Pattern, @Email, @Past, @Future, @Positive, @Negative, @DecimalMin, @DecimalMax, @Digits, @Valid, @UniqueElements
+- Sensitive field detection: keyword matching (password, token, apiKey, ssn, salary, creditCard, etc.) + @JsonIgnore + @JsonProperty(access=WRITE_ONLY)
+- ENTITY graph nodes enriched with "enrichedFields" and "sensitiveFields" metadata
+
+### Frontend Router Extraction
+- buildRouteMap(): Scans files for Vue Router (createRouter), React Router (createBrowserRouter, <Route> JSX), Angular Router (RouterModule.forRoot)
+- Parses route config objects: path, component (including lazy/async imports), children (nested routes), guards (beforeEnter, canActivate, canDeactivate, canLoad)
+- Vue meta guards: detects meta.requiresAuth, meta.roles, meta.guard patterns
+- Component name matching: both base name and full path used to map interactions to routes
+- Route flattening: nested routes resolved to full paths with inherited guards
+
+### Enhanced Call Graph (Phase 3)
+- Promise.then/catch/finally chain resolution: callbacks passed to .then() are traced for HTTP calls
+- Inline arrow functions in .then() callbacks are recursively walked for HTTP calls
+- Function references passed as arguments to any call are registered as potential call targets
+- This captures common patterns like `api.get(url).then(processResponse)` and `fetchData().then(data => updateState(data))`
+
+### Constant/Template Literal URL Resolution (Phase 4)
+- String concatenation (binary + expressions) resolved recursively: `BASE + "/endpoint"` → full URL
+- const variable tracing: if URL argument is an identifier pointing to a const string, the value is inlined
+- Property access tracing: `config.apiUrl` → traces to const object literal declaration
+- Template literal improvement: if interpolated expression is a const identifier, its value is inlined instead of `{param}`
+
+### Frontend Security Guard Detection (Phase 5)
+- Scans handler function bodies for common security check patterns
+- Pattern categories: hasRole/hasAuthority/hasPermission calls, .includes() with role literals, equality checks with role constants, boolean guard checks (isAdmin, isAuthenticated, canAccess, etc.), requireAuth/authorize function calls
+- Detected guards stored in interaction.routeGuards, merged with router-level guards in catalog entries
 
 The system constructs an in-memory Application Graph model, representing backend components and their interactions, enabling detailed traversal and impact analysis. Data flow involves source file analysis by both Java and Node.js engines, graph reconstruction, and conversion into catalog entries. A deterministic classifier assigns `technicalOperation`, `criticalityScore`, and `suggestedMeaning`, with optional LLM enrichment. A robust repository scanner handles large ZIP files efficiently. Database inserts for catalog entries are batched to prevent performance issues with large result sets.
 

@@ -352,6 +352,30 @@ class ScriptSymbolTable {
           if (targetNode && targetNode !== decl.node) {
             decl.calledNodes.push(targetNode);
           }
+
+          if (ts.isPropertyAccessExpression(node.expression)) {
+            const methodName = node.expression.name.text;
+            if ((methodName === "then" || methodName === "catch" || methodName === "finally") && node.arguments.length > 0) {
+              const callback = node.arguments[0];
+              if (ts.isIdentifier(callback)) {
+                const cbNode = this.nameIndex.get(callback.text);
+                if (cbNode && cbNode !== decl.node) {
+                  decl.calledNodes.push(cbNode);
+                }
+              } else if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
+                this.walkBodyForCalls(callback.body, sourceFile, decl);
+              }
+            }
+          }
+
+          for (const arg of node.arguments) {
+            if (ts.isIdentifier(arg)) {
+              const cbNode = this.nameIndex.get(arg.text);
+              if (cbNode && cbNode !== decl.node && !decl.calledNodes.includes(cbNode)) {
+                decl.calledNodes.push(cbNode);
+              }
+            }
+          }
         }
       }
       ts.forEachChild(node, walk);
@@ -3338,8 +3362,99 @@ function extractUrlFromNode(node: ts.Node): string | null {
   if (ts.isTemplateExpression(node)) {
     let result = node.head.text;
     for (const span of node.templateSpans) {
+      const spanExpr = span.expression;
+      if (ts.isIdentifier(spanExpr)) {
+        const constVal = traceLocalConstant(spanExpr);
+        if (constVal) {
+          result += constVal + span.literal.text;
+          continue;
+        }
+      }
       result += "{param}" + span.literal.text;
     }
+    return result;
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = extractUrlFromNode(node.left);
+    const right = extractUrlFromNode(node.right);
+    if (left && right) return left + right;
+    if (left) return left + "{param}";
+    if (right) return "{param}" + right;
+  }
+  if (ts.isIdentifier(node)) {
+    const constVal = traceLocalConstant(node);
+    if (constVal && (constVal.startsWith("/") || constVal.startsWith("http"))) {
+      return constVal;
+    }
+  }
+  if (ts.isPropertyAccessExpression(node)) {
+    const constVal = tracePropertyConstant(node);
+    if (constVal && (constVal.startsWith("/") || constVal.startsWith("http"))) {
+      return constVal;
+    }
+  }
+  return null;
+}
+
+function traceLocalConstant(id: ts.Identifier): string | null {
+  let current: ts.Node | undefined = id.parent;
+  while (current) {
+    if (ts.isSourceFile(current) || ts.isBlock(current)) {
+      break;
+    }
+    current = current.parent;
+  }
+  if (!current) return null;
+
+  let result: string | null = null;
+  const visit = (node: ts.Node) => {
+    if (result !== null) return;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === id.text) {
+      if (node.initializer) {
+        if (ts.isStringLiteral(node.initializer) || ts.isNoSubstitutionTemplateLiteral(node.initializer)) {
+          const modifiers = ts.canHaveModifiers(node.parent?.parent!) ? ts.getModifiers(node.parent?.parent!) : undefined;
+          const isConst = node.parent && ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
+          if (isConst) {
+            result = node.initializer.text;
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(current);
+  return result;
+}
+
+function tracePropertyConstant(node: ts.PropertyAccessExpression): string | null {
+  if (ts.isIdentifier(node.expression)) {
+    const objName = node.expression.text;
+    const propName = node.name.text;
+
+    let current: ts.Node | undefined = node.parent;
+    while (current) {
+      if (ts.isSourceFile(current) || ts.isBlock(current)) break;
+      current = current.parent;
+    }
+    if (!current) return null;
+
+    let result: string | null = null;
+    const visit = (n: ts.Node) => {
+      if (result !== null) return;
+      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === objName) {
+        if (n.initializer && ts.isObjectLiteralExpression(n.initializer)) {
+          for (const prop of n.initializer.properties) {
+            if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === propName) {
+              if (ts.isStringLiteral(prop.initializer)) {
+                result = prop.initializer.text;
+              }
+            }
+          }
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(current);
     return result;
   }
   return null;
@@ -3699,6 +3814,73 @@ function endpointMatchScore(frontendUrl: string, backendPath: string): number {
   return 0;
 }
 
+function detectHandlerSecurityGuards(
+  handlerName: string,
+  symbolTable: ScriptSymbolTable,
+  sourceFile: ts.SourceFile
+): string[] {
+  const guards: string[] = [];
+  const handlerNode = symbolTable.resolveHandlerNode(handlerName);
+  if (!handlerNode) return guards;
+
+  const seen = new Set<string>();
+
+  const ROLE_KEYWORDS = /\b(role|roles|permission|permissions|authority|authorities|access|privilege|admin|moderator|editor|viewer|manager|superadmin)\b/i;
+  const ROLE_LITERALS = /['"`](ROLE_\w+|ADMIN|MODERATOR|EDITOR|VIEWER|MANAGER|SUPER_ADMIN|admin|moderator|editor|viewer|manager|user|guest|operator)['"`]/g;
+
+  const walk = (node: ts.Node) => {
+    if (ts.isIfStatement(node) || ts.isConditionalExpression(node)) {
+      const condition = ts.isIfStatement(node) ? node.expression : node.condition;
+      const condText = condition.getText(sourceFile);
+
+      if (condText.match(/\.hasRole\s*\(/i) || condText.match(/\.hasAuthority\s*\(/i) || condText.match(/\.hasPermission\s*\(/i)) {
+        const match = condText.match(/\.(hasRole|hasAuthority|hasPermission)\s*\(\s*['"`]([^'"` ]+)['"`]\s*\)/i);
+        if (match) {
+          const guard = `${match[1]}:${match[2]}`;
+          if (!seen.has(guard)) { seen.add(guard); guards.push(guard); }
+        }
+      }
+
+      if (condText.match(/\.includes\s*\(/) && ROLE_KEYWORDS.test(condText)) {
+        const roleMatches = Array.from(condText.matchAll(ROLE_LITERALS));
+        for (const m of roleMatches) {
+          const guard = `includes:${m[1]}`;
+          if (!seen.has(guard)) { seen.add(guard); guards.push(guard); }
+        }
+      }
+
+      if (condText.match(/===?\s*['"`]/) && ROLE_KEYWORDS.test(condText)) {
+        const roleMatches = Array.from(condText.matchAll(ROLE_LITERALS));
+        for (const m of roleMatches) {
+          const guard = `equals:${m[1]}`;
+          if (!seen.has(guard)) { seen.add(guard); guards.push(guard); }
+        }
+      }
+
+      if (condText.match(/isAdmin|isAuthenticated|isLoggedIn|isAuthorized|canAccess|canEdit|canDelete|canCreate|hasAccess/i)) {
+        const match = condText.match(/(isAdmin|isAuthenticated|isLoggedIn|isAuthorized|canAccess|canEdit|canDelete|canCreate|hasAccess)/i);
+        if (match) {
+          const guard = `check:${match[1]}`;
+          if (!seen.has(guard)) { seen.add(guard); guards.push(guard); }
+        }
+      }
+    }
+
+    if (ts.isCallExpression(node)) {
+      const callText = node.expression.getText(sourceFile);
+      if (callText.match(/requireAuth|requireRole|checkPermission|guardRoute|authorize/i)) {
+        const guard = `call:${callText}`;
+        if (!seen.has(guard)) { seen.add(guard); guards.push(guard); }
+      }
+    }
+
+    ts.forEachChild(node, walk);
+  };
+
+  walk(handlerNode);
+  return guards;
+}
+
 function resolveBindingsViaNodes(
   bindings: TemplateBinding[],
   symbolTable: ScriptSymbolTable,
@@ -3732,6 +3914,8 @@ function resolveBindingsViaNodes(
     externalCalls = extractExternalCalls(crossFileContext.sourceFile, localNames);
   }
 
+  const scriptSourceFile = crossFileContext?.sourceFile;
+
   for (const binding of bindings) {
     const resolvedCalls = resolveHandlerHttpCalls(
       binding.handlerName, symbolTable, filePath, graph,
@@ -3739,6 +3923,10 @@ function resolveBindingsViaNodes(
       eventGraph, allFiles, serviceMap, allFilePaths,
       stateFlowGraph, archLayerGraph
     );
+
+    const handlerGuards = scriptSourceFile
+      ? detectHandlerSecurityGuards(binding.handlerName, symbolTable, scriptSourceFile)
+      : [];
 
     if (resolvedCalls.length > 0) {
       for (const call of resolvedCalls) {
@@ -3762,6 +3950,7 @@ function resolveBindingsViaNodes(
           resolutionPath: resPath,
           interactionCategory: "HTTP",
           confidence: tierToConfidence(resolution?.tier || null),
+          routeGuards: handlerGuards.length > 0 ? handlerGuards : undefined,
         });
       }
     } else {
@@ -3779,6 +3968,7 @@ function resolveBindingsViaNodes(
         resolutionPath: null,
         interactionCategory: "UI_ONLY",
         confidence: 1.0,
+        routeGuards: handlerGuards.length > 0 ? handlerGuards : undefined,
       });
     }
   }
@@ -4628,7 +4818,8 @@ export function analyzeFrontend(
       const routeInfo = routeMap.get(componentName);
       if (routeInfo) {
         interaction.frontendRoute = routeInfo.route;
-        interaction.routeGuards = routeInfo.guards;
+        const existingGuards = interaction.routeGuards || [];
+        interaction.routeGuards = Array.from(new Set([...routeInfo.guards, ...existingGuards]));
         routeEnriched++;
       } else {
         const fileName = interaction.sourceFile
@@ -4639,7 +4830,8 @@ export function analyzeFrontend(
           const routeInfoByFile = routeMap.get(fileName);
           if (routeInfoByFile) {
             interaction.frontendRoute = routeInfoByFile.route;
-            interaction.routeGuards = routeInfoByFile.guards;
+            const existingGuards = interaction.routeGuards || [];
+            interaction.routeGuards = Array.from(new Set([...routeInfoByFile.guards, ...existingGuards]));
             routeEnriched++;
           }
         }
