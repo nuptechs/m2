@@ -380,7 +380,9 @@ export function interactionsToCatalogEntries(
       architectureType: architectureType,
       interactionCategory: category,
       confidence: computeStructuralConfidence(interaction.resolutionPath, controllerClass, repositoryMethods),
-      requiredRoles,
+      requiredRoles: interaction.detectedRoles && interaction.detectedRoles.length > 0
+        ? Array.from(new Set([...requiredRoles, ...interaction.detectedRoles]))
+        : requiredRoles,
       securityAnnotations: securityAnns,
       entityFieldsMetadata: entityFieldsMeta,
       sensitiveFieldsAccessed,

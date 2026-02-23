@@ -9,6 +9,7 @@ import { computeFileHashes, detectChanges } from "./change-detector";
 import type { FileHash } from "./change-detector";
 import type { InsertCatalogEntry } from "@shared/schema";
 import { analyzeSecurityOmissions, type SecurityFinding, type SecurityCoverageMetrics } from "../security/omission-engine";
+import { enrichCatalogEntriesWithInference } from "../analyzers/frontend-inference-engine";
 
 export interface FileData {
   filePath: string;
@@ -166,6 +167,9 @@ export class AnalysisPipeline {
       );
       catalogEntryData = this.classify(catalogEntryData);
 
+      this.progress("Inference", "Enriching entries with inferred backend structure...");
+      catalogEntryData = enrichCatalogEntriesWithInference(catalogEntryData);
+
       if (catalogEntryData.length > 0) {
         await storage.deleteCatalogEntriesByProject(projectId);
       }
@@ -268,7 +272,7 @@ export class AnalysisPipeline {
     appGraph: any, analysisRunId: number, projectId: number, archType: string
   ): InsertCatalogEntry[] {
     let catalogEntryData = interactionsToCatalogEntries(
-      frontendInteractions, appGraph, analysisRunId, projectId, archType
+      frontendInteractions, appGraph, analysisRunId, projectId, archType as any
     );
 
     if (catalogEntryData.length === 0 && endpointImpacts.length > 0) {

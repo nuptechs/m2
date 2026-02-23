@@ -150,6 +150,36 @@ export function generateComplianceReport(
     <table><thead><tr><th>Controller</th><th>Total</th><th>Protected</th><th>Coverage</th></tr></thead><tbody>${ctrlRows}</tbody></table>`;
   };
 
+  const renderCompleteness = (): string => {
+    const c = manifest.completeness;
+    if (!c) return "<p>Completeness metrics not available.</p>";
+    const metrics = [
+      { label: "Endpoint Resolution", value: c.endpointResolution, desc: "Interactions with resolved HTTP endpoints" },
+      { label: "Route Coverage", value: c.routeCoverage, desc: "Screens with mapped frontend routes" },
+      { label: "Security Coverage", value: c.securityCoverage, desc: "Endpoints with roles or guards" },
+      { label: "Entity Coverage", value: c.entityCoverage, desc: "Endpoints with entity mappings" },
+      { label: "Controller Coverage", value: c.controllerCoverage, desc: "Endpoints with controller info" },
+    ];
+    let rows = "";
+    for (const m of metrics) {
+      const color = m.value >= 80 ? "#22c55e" : m.value >= 50 ? "#ca8a04" : "#dc2626";
+      rows += `<tr>
+        <td>${escapeHtml(m.label)}</td>
+        <td>${escapeHtml(m.desc)}</td>
+        <td><div class="progress-bar"><div class="progress-fill" style="width: ${m.value}%; background: ${color}"></div></div> ${m.value}%</td>
+      </tr>`;
+    }
+    const overallColor = c.overallScore >= 80 ? "#22c55e" : c.overallScore >= 50 ? "#ca8a04" : "#dc2626";
+    return `<div class="summary-card" style="display: inline-block; margin-bottom: 16px;">
+      <div class="value" style="color: ${overallColor}">${c.overallScore}%</div>
+      <div class="label">Overall Completeness</div>
+    </div>
+    <table>
+      <thead><tr><th>Metric</th><th>Description</th><th>Coverage</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  };
+
   const renderChecklist = (): string => {
     let items = "";
     for (const item of checklistItems) {
@@ -271,7 +301,12 @@ export function generateComplianceReport(
   </section>
 
   <section>
-    <h2>Section 6 &mdash; Compliance Checklist</h2>
+    <h2>Section 6 &mdash; Analysis Completeness</h2>
+    ${renderCompleteness()}
+  </section>
+
+  <section>
+    <h2>Section 7 &mdash; Compliance Checklist</h2>
     <div class="checklist">
       ${renderChecklist()}
     </div>

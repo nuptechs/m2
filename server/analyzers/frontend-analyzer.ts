@@ -33,6 +33,7 @@ export interface FrontendInteraction {
   confidence: number;
   frontendRoute?: string | null;
   routeGuards?: string[];
+  detectedRoles?: string[];
   externalDomain?: string | null;
   operationHint?: string | null;
 }
@@ -891,6 +892,22 @@ function extractHttpCallFromExpression(node: ts.CallExpression, sourceFile: ts.S
   }
 
   if (ts.isIdentifier(expr) && (expr.text === "fetch" || httpClients.isHttpClient(expr.text))) {
+    if (node.arguments.length >= 2) {
+      const firstArg = node.arguments[0];
+      if (ts.isStringLiteral(firstArg)) {
+        const firstVal = firstArg.text.toUpperCase();
+        const httpMethods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+        if (httpMethods.includes(firstVal)) {
+          const url = varMap
+            ? resolveUrlFromExpression(node.arguments[1] as ts.Expression, varMap)
+            : extractUrlFromNode(node.arguments[1]);
+          if (url) {
+            const operationHint = extractOperationHint(node, sourceFile, 1);
+            return { method: firstVal, url, lineNumber: getLineNumber(sourceFile, node.getStart(sourceFile)), callerFunction: callerName, operationHint };
+          }
+        }
+      }
+    }
     if (node.arguments.length > 0) {
       const url = varMap
         ? resolveUrlFromExpression(node.arguments[0] as ts.Expression, varMap)
@@ -1212,6 +1229,215 @@ function buildGlobalCallGraph(files: { filePath: string; content: string }[], se
       };
       indexDecls(sourceFile);
 
+      const detectReactQueryHooks = (node: ts.Node) => {
+        if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)) {
+          const callExpr = node.initializer.expression;
+          let hookName = "";
+          if (ts.isIdentifier(callExpr)) hookName = callExpr.text;
+          
+          if (hookName === "useMutation" || hookName === "useQuery") {
+            const destructuredNames: string[] = [];
+            if (ts.isObjectBindingPattern(node.name)) {
+              for (const el of node.name.elements) {
+                if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
+                  destructuredNames.push(el.name.text);
+                }
+              }
+            } else if (ts.isIdentifier(node.name)) {
+              destructuredNames.push(node.name.text);
+            }
+
+            const hookHttpCalls: HttpCall[] = [];
+
+            if (hookName === "useQuery" && node.initializer.arguments.length > 0) {
+              const arg = node.initializer.arguments[0];
+              if (ts.isObjectLiteralExpression(arg)) {
+                for (const prop of arg.properties) {
+                  if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === "queryKey") {
+                    if (ts.isArrayLiteralExpression(prop.initializer) && prop.initializer.elements.length > 0) {
+                      const firstEl = prop.initializer.elements[0];
+                      if (ts.isStringLiteral(firstEl)) {
+                        const url = firstEl.text;
+                        if (url.startsWith("/") || url.startsWith("http")) {
+                          hookHttpCalls.push({
+                            method: "GET", url,
+                            lineNumber: getLineNumber(sourceFile, node.getStart(sourceFile)),
+                            callerFunction: hookName, operationHint: null
+                          });
+                        }
+                      }
+                    } else if (ts.isArrayLiteralExpression(prop.initializer) && prop.initializer.elements.length > 1) {
+                      for (const el of prop.initializer.elements) {
+                        if (ts.isStringLiteral(el) && (el.text.startsWith("/api") || el.text.startsWith("http"))) {
+                          hookHttpCalls.push({
+                            method: "GET", url: el.text,
+                            lineNumber: getLineNumber(sourceFile, node.getStart(sourceFile)),
+                            callerFunction: hookName, operationHint: null
+                          });
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === "queryFn") {
+                    if (ts.isArrowFunction(prop.initializer) || ts.isFunctionExpression(prop.initializer)) {
+                      const visitQfn = (n: ts.Node) => {
+                        if (ts.isCallExpression(n)) {
+                          const hc = extractHttpCallFromExpression(n, sourceFile, httpClients, hookName, undefined);
+                          if (hc) hookHttpCalls.push(hc);
+                        }
+                        ts.forEachChild(n, visitQfn);
+                      };
+                      visitQfn(prop.initializer.body);
+                    }
+                  }
+                }
+              }
+            }
+
+            if (hookName === "useMutation" && node.initializer.arguments.length > 0) {
+              const arg = node.initializer.arguments[0];
+              if (ts.isObjectLiteralExpression(arg)) {
+                for (const prop of arg.properties) {
+                  if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === "mutationFn") {
+                    if (ts.isArrowFunction(prop.initializer) || ts.isFunctionExpression(prop.initializer)) {
+                      const visitMfn = (n: ts.Node) => {
+                        if (ts.isCallExpression(n)) {
+                          const hc = extractHttpCallFromExpression(n, sourceFile, httpClients, hookName, undefined);
+                          if (hc) hookHttpCalls.push(hc);
+                          if (!hc) {
+                            if (ts.isIdentifier(n.expression)) {
+                              const calledName = n.expression.text;
+                              if (localFunctions.has(calledName)) {
+                                const calleeKey = makeGlobalKey(file.filePath, calledName);
+                                for (const dName of destructuredNames) {
+                                  const dKey = makeGlobalKey(file.filePath, dName);
+                                  if (!graph.has(dKey)) {
+                                    graph.set(dKey, { key: dKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+                                  }
+                                  graph.get(dKey)!.callees.add(calleeKey);
+                                }
+                              } else if (importBindings.has(calledName)) {
+                                const binding = importBindings.get(calledName)!;
+                                const targetName = binding.isDefault ? "default" : binding.originalName;
+                                const calleeKey = makeGlobalKey(binding.sourcePath, targetName);
+                                for (const dName of destructuredNames) {
+                                  const dKey = makeGlobalKey(file.filePath, dName);
+                                  if (!graph.has(dKey)) {
+                                    graph.set(dKey, { key: dKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+                                  }
+                                  graph.get(dKey)!.callees.add(calleeKey);
+                                }
+                              }
+                            } else if (ts.isPropertyAccessExpression(n.expression) && ts.isIdentifier(n.expression.expression)) {
+                              const objName = n.expression.expression.text;
+                              const methodName = n.expression.name.text;
+                              if (importBindings.has(objName)) {
+                                const binding = importBindings.get(objName)!;
+                                for (const dName of destructuredNames) {
+                                  const dKey = makeGlobalKey(file.filePath, dName);
+                                  if (!graph.has(dKey)) {
+                                    graph.set(dKey, { key: dKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+                                  }
+                                  graph.get(dKey)!.callees.add(makeGlobalKey(binding.sourcePath, methodName));
+                                  graph.get(dKey)!.callees.add(makeGlobalKey(binding.sourcePath, binding.originalName + "." + methodName));
+                                }
+                              }
+                            }
+                          }
+                        }
+                        ts.forEachChild(n, visitMfn);
+                      };
+                      visitMfn(prop.initializer.body);
+                    }
+                  }
+                }
+              }
+              if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) {
+                const visitMfn = (n: ts.Node) => {
+                  if (ts.isCallExpression(n)) {
+                    const hc = extractHttpCallFromExpression(n, sourceFile, httpClients, hookName, undefined);
+                    if (hc) hookHttpCalls.push(hc);
+                  }
+                  ts.forEachChild(n, visitMfn);
+                };
+                visitMfn(arg.body);
+              }
+            }
+
+            if (hookHttpCalls.length > 0) {
+              for (const dName of destructuredNames) {
+                const dKey = makeGlobalKey(file.filePath, dName);
+                if (!graph.has(dKey)) {
+                  graph.set(dKey, { key: dKey, filePath: file.filePath, functionName: dName, httpCalls: hookHttpCalls, callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+                } else {
+                  const existing = graph.get(dKey)!;
+                  if (existing.httpCalls.length === 0) existing.httpCalls = hookHttpCalls;
+                }
+              }
+              const mutateNames = ["mutate", "mutateAsync"];
+              for (const mn of mutateNames) {
+                if (!destructuredNames.includes(mn)) {
+                  const mnKey = makeGlobalKey(file.filePath, mn);
+                  if (!graph.has(mnKey)) {
+                    graph.set(mnKey, { key: mnKey, filePath: file.filePath, functionName: mn, httpCalls: hookHttpCalls, callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+                  }
+                }
+              }
+            }
+          }
+        }
+        ts.forEachChild(node, detectReactQueryHooks);
+      };
+      detectReactQueryHooks(sourceFile);
+
+      const detectCustomHookReturns = (node: ts.Node) => {
+        if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)) {
+          if (!ts.isObjectBindingPattern(node.name)) {
+            ts.forEachChild(node, detectCustomHookReturns);
+            return;
+          }
+          const callExpr = node.initializer.expression;
+          let hookName = "";
+          let hookSourcePath = "";
+          if (ts.isIdentifier(callExpr)) {
+            hookName = callExpr.text;
+          }
+          if (!hookName || !hookName.startsWith("use") || hookName === "useMutation" || hookName === "useQuery" || hookName === "useState" || hookName === "useEffect" || hookName === "useRef" || hookName === "useCallback" || hookName === "useMemo" || hookName === "useContext" || hookName === "useReducer" || hookName === "useNavigate" || hookName === "useLocation" || hookName === "useParams" || hookName === "useSearchParams") {
+            ts.forEachChild(node, detectCustomHookReturns);
+            return;
+          }
+
+          if (importBindings.has(hookName)) {
+            hookSourcePath = importBindings.get(hookName)!.sourcePath;
+          } else if (localFunctions.has(hookName)) {
+            hookSourcePath = file.filePath;
+          }
+          if (!hookSourcePath) {
+            ts.forEachChild(node, detectCustomHookReturns);
+            return;
+          }
+
+          const destructuredNames: string[] = [];
+          for (const el of node.name.elements) {
+            if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
+              destructuredNames.push(el.name.text);
+            }
+          }
+
+          for (const dName of destructuredNames) {
+            const localKey = makeGlobalKey(file.filePath, dName);
+            const hookKey = makeGlobalKey(hookSourcePath, dName);
+            if (!graph.has(localKey)) {
+              graph.set(localKey, { key: localKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+            }
+            graph.get(localKey)!.callees.add(hookKey);
+          }
+        }
+        ts.forEachChild(node, detectCustomHookReturns);
+      };
+      detectCustomHookReturns(sourceFile);
+
       const localFnEntries = Array.from(localFunctions.entries());
       for (const [fnName, fnInfo] of localFnEntries) {
         const key = makeGlobalKey(file.filePath, fnName);
@@ -1243,6 +1469,11 @@ function buildGlobalCallGraph(files: { filePath: string; content: string }[], se
                   const targetName = binding.isDefault ? "default" : binding.originalName;
                   const calleeKey = makeGlobalKey(binding.sourcePath, targetName);
                   gNode.callees.add(calleeKey);
+                } else {
+                  const sameFileKey = makeGlobalKey(file.filePath, calledName);
+                  if (graph.has(sameFileKey)) {
+                    gNode.callees.add(sameFileKey);
+                  }
                 }
               }
 
@@ -4080,6 +4311,69 @@ function endpointMatchScore(frontendUrl: string, backendPath: string): number {
   return 0;
 }
 
+interface FileAuthPatterns {
+  guards: string[];
+  roles: string[];
+  authRequired: boolean;
+}
+
+function detectFileAuthPatterns(sourceFile: ts.SourceFile, content: string): FileAuthPatterns {
+  const guards: string[] = [];
+  const roles: string[] = [];
+  let authRequired = false;
+
+  const AUTH_HOOK_PATTERNS = /\b(useAuth|useAuthentication|useSession|useUser|usePermission|useAuthorization|useLogin|useCurrentUser)\b/;
+  const AUTH_HOC_PATTERNS = /\b(withAuth|withAuthentication|withSession|withUser|withPermission|requireAuth)\b/;
+  const AUTH_HEADER_PATTERNS = /['"`]Authorization['"`]|Bearer\s|X-API-Key|x-auth-token/i;
+  const TOKEN_PATTERNS = /localStorage\s*\.\s*getItem\s*\(\s*['"`](token|access_token|auth_token|jwt|session|sessionId)['"`]\s*\)|sessionStorage\s*\.\s*getItem/i;
+
+  if (AUTH_HOOK_PATTERNS.test(content)) {
+    const match = content.match(AUTH_HOOK_PATTERNS);
+    if (match) {
+      guards.push(`hook:${match[1]}`);
+      authRequired = true;
+    }
+  }
+
+  if (AUTH_HOC_PATTERNS.test(content)) {
+    const match = content.match(AUTH_HOC_PATTERNS);
+    if (match) {
+      guards.push(`hoc:${match[1]}`);
+      authRequired = true;
+    }
+  }
+
+  if (AUTH_HEADER_PATTERNS.test(content)) {
+    guards.push("auth:header");
+    authRequired = true;
+  }
+
+  if (TOKEN_PATTERNS.test(content)) {
+    guards.push("auth:token");
+    authRequired = true;
+  }
+
+  const ROLE_EXTRACT = /['"`](ADMIN|ROLE_ADMIN|admin|MANAGER|MODERATOR|EDITOR|VIEWER|SUPER_ADMIN|OPERATOR|USER|AUTHENTICATED)['"`]/g;
+  const roleMatches = Array.from(content.matchAll(ROLE_EXTRACT));
+  for (const m of roleMatches) {
+    const role = m[1].toUpperCase();
+    if (!roles.includes(role)) roles.push(role);
+  }
+
+  const CONDITIONAL_AUTH = /\{.*\b(isAdmin|isAuthenticated|isLoggedIn|isAuthorized|user\.role|currentUser)\b.*&&/;
+  if (CONDITIONAL_AUTH.test(content)) {
+    authRequired = true;
+    const match = content.match(/(isAdmin|isAuthenticated|isLoggedIn|isAuthorized)/i);
+    if (match) guards.push(`conditional:${match[1]}`);
+  }
+
+  if (authRequired && roles.length === 0) {
+    roles.push("AUTHENTICATED");
+  }
+
+  return { guards, roles, authRequired };
+}
+
 function detectHandlerSecurityGuards(
   handlerName: string,
   symbolTable: ScriptSymbolTable,
@@ -4911,6 +5205,99 @@ interface RouteDefinition {
 
 type RouteMap = Map<string, { route: string; guards: string[] }>;
 
+const GUARD_COMPONENT_NAMES = new Set([
+  "protectedroute", "requireauth", "requireauthentication", "authguard",
+  "privateroute", "authroute", "guardedroute", "secureroute",
+  "authenticatedroute", "authrequired", "loginrequired", "withauth",
+]);
+
+function extractComponentFromJsxElement(node: ts.Node, sourceFile: ts.SourceFile, guards: string[]): string | null {
+  if (ts.isJsxSelfClosingElement(node)) {
+    const tag = node.tagName.getText(sourceFile);
+    if (GUARD_COMPONENT_NAMES.has(tag.toLowerCase())) {
+      guards.push(tag);
+      return null;
+    }
+    return tag;
+  }
+
+  if (ts.isJsxElement(node)) {
+    const tag = node.openingElement.tagName.getText(sourceFile);
+    if (GUARD_COMPONENT_NAMES.has(tag.toLowerCase())) {
+      guards.push(tag);
+      for (const child of node.children) {
+        if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child)) {
+          const inner = extractComponentFromJsxElement(child, sourceFile, guards);
+          if (inner) return inner;
+        }
+      }
+    }
+    return tag;
+  }
+
+  if (ts.isCallExpression(node)) {
+    const text = node.expression.getText(sourceFile);
+    if (text.includes("lazy") || text.includes("Suspense")) {
+      for (const arg of node.arguments) {
+        if (ts.isArrowFunction(arg) && arg.body) {
+          const bodyText = arg.body.getText(sourceFile);
+          const match = bodyText.match(/import\(["']([^"']+)["']\)/);
+          if (match) {
+            const parts = match[1].split("/");
+            return parts[parts.length - 1].replace(/\.(tsx|jsx|ts|js|vue)$/, "");
+          }
+        }
+      }
+    }
+  }
+
+  const text = node.getText(sourceFile).replace(/<|\/>/g, "").trim();
+  const firstWord = text.split(/[\s({]/)[0];
+  return firstWord || null;
+}
+
+function extractJsxRoute(node: ts.JsxElement | ts.JsxSelfClosingElement, sourceFile: ts.SourceFile): RouteDefinition | null {
+  const attrs = ts.isJsxElement(node) ? node.openingElement.attributes : node.attributes;
+  let path = "";
+  let component = "";
+  const guards: string[] = [];
+
+  for (const attr of attrs.properties) {
+    if (ts.isJsxAttribute(attr) && attr.name) {
+      const attrName = attr.name.getText(sourceFile);
+      if (attrName === "path" && attr.initializer) {
+        if (ts.isStringLiteral(attr.initializer)) {
+          path = attr.initializer.text;
+        } else if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression && ts.isStringLiteral(attr.initializer.expression)) {
+          path = attr.initializer.expression.text;
+        }
+      }
+      if ((attrName === "element" || attrName === "component") && attr.initializer) {
+        if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression) {
+          const extracted = extractComponentFromJsxElement(attr.initializer.expression, sourceFile, guards);
+          component = extracted || attr.initializer.expression.getText(sourceFile).replace(/<|\/>/g, "").trim();
+        }
+      }
+    }
+  }
+
+  const childRoutes: RouteDefinition[] = [];
+  if (ts.isJsxElement(node)) {
+    for (const child of node.children) {
+      if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child)) {
+        const childTag = ts.isJsxElement(child) ? child.openingElement.tagName.getText(sourceFile) : child.tagName.getText(sourceFile);
+        if (childTag === "Route") {
+          const childRoute = extractJsxRoute(child, sourceFile);
+          if (childRoute) childRoutes.push(childRoute);
+        }
+      }
+    }
+  }
+
+  if (path) return { path, component, guards, children: childRoutes };
+  return null;
+}
+
 function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap {
   const routeMap: RouteMap = new Map();
   const allRoutes: RouteDefinition[] = [];
@@ -4922,13 +5309,22 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
 
     const isRouterFile = file.filePath.toLowerCase().includes("router") ||
       file.filePath.toLowerCase().includes("routes") ||
-      file.filePath.toLowerCase().includes("routing");
+      file.filePath.toLowerCase().includes("routing") ||
+      file.filePath.toLowerCase().endsWith("app.tsx") ||
+      file.filePath.toLowerCase().endsWith("app.jsx") ||
+      file.filePath.toLowerCase().endsWith("app.vue");
     const hasRouterImport = file.content.includes("createRouter") ||
       file.content.includes("vue-router") ||
       file.content.includes("react-router") ||
       file.content.includes("@angular/router") ||
       file.content.includes("createBrowserRouter") ||
-      file.content.includes("RouterModule");
+      file.content.includes("RouterModule") ||
+      file.content.includes("wouter") ||
+      file.content.includes("<Route") ||
+      file.content.includes("<Switch") ||
+      file.content.includes("<Routes") ||
+      file.content.includes("useRoute") ||
+      file.content.includes("useLocation");
 
     if (!isRouterFile && !hasRouterImport) continue;
 
@@ -4946,9 +5342,16 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
       }
       const sourceFile = parseTypeScript(content, file.filePath);
       const routes = extractRoutesFromAST(sourceFile, file.filePath);
+      if (routes.length === 0) {
+        const hasRoute = content.includes("<Route");
+        const hasSwitch = content.includes("<Switch");
+        if (hasRoute || hasSwitch) {
+          console.log(`[frontend-analyzer] Route debug: ${file.filePath} has <Route>=${hasRoute}, <Switch>=${hasSwitch} in content but AST found 0 routes`);
+        }
+      }
       allRoutes.push(...routes);
     } catch (err) {
-      // skip unparseable files
+      console.warn(`[frontend-analyzer] Route parse error in ${file.filePath}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -4979,6 +5382,22 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
 
   if (allRoutes.length > 0) {
     console.log(`[frontend-analyzer] Router extraction: ${allRoutes.length} routes found, ${routeMap.size} component mappings`);
+    const routeEntries = Array.from(routeMap.entries());
+    for (const [name, info] of routeEntries.slice(0, 10)) {
+      console.log(`[frontend-analyzer]   Route: ${name} → ${info.route} [guards: ${info.guards.join(",")||"none"}]`);
+    }
+  } else {
+    const routerFiles = files.filter(f => {
+      const ext = f.filePath.substring(f.filePath.lastIndexOf("."));
+      if (![".ts", ".js", ".tsx", ".jsx", ".vue"].includes(ext)) return false;
+      if (f.filePath.includes("node_modules")) return false;
+      const isRouterFile = f.filePath.toLowerCase().includes("router") || f.filePath.toLowerCase().endsWith("app.tsx") || f.filePath.toLowerCase().endsWith("app.jsx") || f.filePath.toLowerCase().endsWith("app.vue");
+      const hasImport = f.content.includes("<Route") || f.content.includes("useRoute") || f.content.includes("wouter") || f.content.includes("react-router");
+      return isRouterFile || hasImport;
+    });
+    if (routerFiles.length > 0) {
+      console.log(`[frontend-analyzer] Router extraction: 0 routes found from ${routerFiles.length} router-candidate files: ${routerFiles.map(f => f.filePath).join(", ")}`);
+    }
   }
 
   return routeMap;
@@ -5044,6 +5463,7 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
         const attrs = ts.isJsxElement(node) ? node.openingElement.attributes : node.attributes;
         let path = "";
         let component = "";
+        const guards: string[] = [];
 
         for (const attr of attrs.properties) {
           if (ts.isJsxAttribute(attr) && attr.name) {
@@ -5057,14 +5477,30 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
             }
             if ((attrName === "element" || attrName === "component") && attr.initializer) {
               if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression) {
-                component = attr.initializer.expression.getText(sourceFile).replace(/<|\/>/g, "").trim();
+                const elementText = attr.initializer.expression.getText(sourceFile);
+                const extracted = extractComponentFromJsxElement(attr.initializer.expression, sourceFile, guards);
+                component = extracted || elementText.replace(/<|\/>/g, "").trim();
+              }
+            }
+          }
+        }
+
+        const childRoutes: RouteDefinition[] = [];
+        if (ts.isJsxElement(node)) {
+          for (const child of node.children) {
+            if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child)) {
+              const childTag = ts.isJsxElement(child) ? child.openingElement.tagName.getText(sourceFile) : child.tagName.getText(sourceFile);
+              if (childTag === "Route") {
+                const childRoute = extractJsxRoute(child, sourceFile);
+                if (childRoute) childRoutes.push(childRoute);
               }
             }
           }
         }
 
         if (path) {
-          routes.push({ path, component, guards: [], children: [] });
+          routes.push({ path, component, guards, children: childRoutes });
+          return;
         }
       }
     }
@@ -5379,6 +5815,41 @@ export function analyzeFrontend(
     if (routeEnriched > 0) {
       console.log(`[frontend-analyzer] Route enrichment: ${routeEnriched}/${interactions.length} interactions mapped to routes`);
     }
+  }
+
+  const fileAuthCache = new Map<string, FileAuthPatterns>();
+  let authEnriched = 0;
+  for (const interaction of interactions) {
+    if (!fileAuthCache.has(interaction.sourceFile)) {
+      const fileData = files.find(f => f.filePath === interaction.sourceFile);
+      if (fileData) {
+        let scriptContent = fileData.content;
+        if (fileData.filePath.endsWith(".vue")) {
+          scriptContent = extractVueScript(fileData.content);
+        }
+        try {
+          const sf = parseTypeScript(scriptContent, fileData.filePath);
+          fileAuthCache.set(interaction.sourceFile, detectFileAuthPatterns(sf, scriptContent));
+        } catch {
+          fileAuthCache.set(interaction.sourceFile, { guards: [], roles: [], authRequired: false });
+        }
+      }
+    }
+    const authPatterns = fileAuthCache.get(interaction.sourceFile);
+    if (authPatterns && authPatterns.authRequired) {
+      const existing = interaction.routeGuards || [];
+      const merged = Array.from(new Set([...existing, ...authPatterns.guards]));
+      if (merged.length > 0) {
+        interaction.routeGuards = merged;
+      }
+      if (!interaction.detectedRoles) {
+        interaction.detectedRoles = authPatterns.roles;
+      }
+      authEnriched++;
+    }
+  }
+  if (authEnriched > 0) {
+    console.log(`[frontend-analyzer] Auth enrichment: ${authEnriched}/${interactions.length} interactions with detected auth patterns`);
   }
 
   const withUrls = interactions.filter(i => i.url);

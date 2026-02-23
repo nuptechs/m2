@@ -77,6 +77,14 @@ export interface PermaCatManifest {
     criticalityScore: number;
     sensitiveData: boolean;
   }[];
+  completeness: {
+    endpointResolution: number;
+    routeCoverage: number;
+    securityCoverage: number;
+    entityCoverage: number;
+    controllerCoverage: number;
+    overallScore: number;
+  };
 }
 
 export function generateManifest(project: Project, entries: CatalogEntry[]): PermaCatManifest {
@@ -221,6 +229,24 @@ export function generateManifest(project: Project, entries: CatalogEntry[]): Per
     };
   });
 
+  const interactionsWithEndpoint = entries.filter(e => e.endpoint).length;
+  const endpointResolution = entries.length > 0 ? Math.round((interactionsWithEndpoint / entries.length) * 100) : 0;
+
+  const screensWithRoutes = allScreens.filter(s => {
+    return s.interactions.some(i => i.endpoint);
+  }).length;
+  const routeCoverage = allScreens.length > 0 ? Math.round((screensWithRoutes / allScreens.length) * 100) : 0;
+
+  const endpointsWithEntity = allEndpoints.filter(e => e.entitiesTouched.length > 0).length;
+  const entityCoverage = allEndpoints.length > 0 ? Math.round((endpointsWithEntity / allEndpoints.length) * 100) : 0;
+
+  const endpointsWithController = allEndpoints.filter(e => e.controller).length;
+  const controllerCoverage = allEndpoints.length > 0 ? Math.round((endpointsWithController / allEndpoints.length) * 100) : 0;
+
+  const overallScore = Math.round(
+    (endpointResolution * 0.30 + routeCoverage * 0.15 + securityCoverage * 0.25 + entityCoverage * 0.15 + controllerCoverage * 0.15)
+  );
+
   return {
     $schema: "https://permacat.dev/schemas/manifest-v1.json",
     version: "1.0.0",
@@ -245,6 +271,14 @@ export function generateManifest(project: Project, entries: CatalogEntry[]): Per
     roles: allRoles,
     entities: allEntities,
     securityMatrix,
+    completeness: {
+      endpointResolution,
+      routeCoverage,
+      securityCoverage,
+      entityCoverage,
+      controllerCoverage,
+      overallScore,
+    },
   };
 }
 
