@@ -38,6 +38,10 @@ A **Platform Integration System** enables external system access via API Key Aut
 
 A **System Explorer** page provides a visual map of the analyzed system, grouping catalog entries by screen, with clickable interaction blocks that display a detailed trace panel showing the full resolution path from Frontend Interaction to Entities Touched, including all relevant metadata.
 
+## Known Technical Notes
+- **TypeScript ESM Import**: The `typescript` module must be imported via `import _ts from "typescript"; import ts = _ts;` pattern in `frontend-analyzer.ts` to handle ESM default export wrapping in the `tsx` runner. Using `import * as ts from "typescript"` can result in `ts.ScriptKind` being `undefined` at runtime.
+- **Pipeline Safety**: The analysis pipeline (`analysis-pipeline.ts`) only deletes existing catalog entries when the new analysis produces entries (>0). This prevents data loss if parsing fails.
+
 ## External Dependencies
 - PostgreSQL
 - OpenAI LLM (via Replit AI Integrations)

@@ -96,7 +96,6 @@ export class AnalysisPipeline {
     try {
       await storage.updateProjectStatus(projectId, "analyzing");
       await storage.updateAnalysisRun(analysisRun.id, { status: "analyzing" });
-      await storage.deleteCatalogEntriesByProject(projectId);
 
       const javaFiles = fileData.filter(f => f.filePath.endsWith(".java"));
       const frontendFiles = fileData.filter(f => !f.filePath.endsWith(".java"));
@@ -166,6 +165,10 @@ export class AnalysisPipeline {
         frontendInteractions, endpointImpacts, appGraph, analysisRun.id, projectId, archType
       );
       catalogEntryData = this.classify(catalogEntryData);
+
+      if (catalogEntryData.length > 0) {
+        await storage.deleteCatalogEntriesByProject(projectId);
+      }
       const created = await this.persist(catalogEntryData);
 
       this.progress("Security", "Running security omission analysis...");

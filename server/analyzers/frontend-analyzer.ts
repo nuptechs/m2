@@ -1,7 +1,9 @@
-import * as ts from "typescript";
+import _ts from "typescript";
 import * as vueSfc from "@vue/compiler-sfc";
 import * as ngCompiler from "@angular/compiler";
 import type { ApplicationGraph, GraphNode } from "./application-graph";
+
+import ts = _ts;
 
 export interface ResolutionStep {
   tier: string;
