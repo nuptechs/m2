@@ -39,7 +39,7 @@ export function getOpenAPISpec() {
                     options: {
                       type: "object",
                       properties: {
-                        format: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "all"], default: "manifest" },
+                        format: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "keycloak-realm", "opa-rego", "compliance-report", "all"], default: "manifest" },
                         projectName: { type: "string", default: "headless-<timestamp>" },
                       },
                     },
@@ -62,7 +62,7 @@ export function getOpenAPISpec() {
           summary: "Analyze ZIP file (headless)",
           description: "Upload a ZIP file containing source code for analysis. Returns analysis results + manifest.",
           parameters: [
-            { name: "format", in: "query", schema: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "all"] } },
+            { name: "format", in: "query", schema: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "keycloak-realm", "opa-rego", "compliance-report", "all"] } },
           ],
           requestBody: {
             required: true,
@@ -143,9 +143,11 @@ export function getOpenAPISpec() {
         get: {
           tags: ["Manifests"],
           summary: "Generate manifest in specified format",
+          description: "Supports 7 output formats: manifest (JSON), agents-md (Markdown), openapi (OpenAPI 3.0), policy-matrix (Keycloak/Okta/AWS IAM), keycloak-realm (importable Keycloak realm JSON), opa-rego (OPA/Rego policy), compliance-report (SOC2/LGPD HTML audit report).",
           parameters: [
             { name: "projectId", in: "path", required: true, schema: { type: "integer" } },
-            { name: "format", in: "query", schema: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "all"] } },
+            { name: "format", in: "query", schema: { type: "string", enum: ["manifest", "agents-md", "openapi", "policy-matrix", "keycloak-realm", "opa-rego", "compliance-report", "all"] }, description: "Output format" },
+            { name: "bundle", in: "query", schema: { type: "string", enum: ["true"] }, description: "For opa-rego format: return OPA bundle as JSON instead of raw .rego text" },
           ],
           responses: { 200: { description: "Manifest in requested format" } },
         },

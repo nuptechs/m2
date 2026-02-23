@@ -12,6 +12,9 @@ import { generateManifest } from "./generators/manifest-generator";
 import { generateAgentsMd } from "./generators/agents-md-generator";
 import { generateOpenAPISpec } from "./generators/openapi-generator";
 import { generatePolicyMatrix } from "./generators/policy-matrix-generator";
+import { generateKeycloakRealm } from "./generators/keycloak-realm-generator";
+import { generateOpaRego } from "./generators/opa-rego-generator";
+import { generateComplianceReport } from "./generators/compliance-report-generator";
 import { AnalysisPipeline } from "./pipeline/analysis-pipeline";
 import { apiAuthMiddleware, generateApiKey, hashApiKey } from "./middleware/api-auth";
 import { z } from "zod";
@@ -192,10 +195,28 @@ export async function registerRoutes(
         output.openapi = generateOpenAPISpec(manifest);
       } else if (format === "policy-matrix") {
         output.policyMatrix = generatePolicyMatrix(manifest);
+      } else if (format === "keycloak-realm") {
+        const findings = await storage.getSecurityFindings(project.id);
+        output.keycloakRealm = generateKeycloakRealm(manifest, findings);
+      } else if (format === "opa-rego") {
+        output.opaRego = generateOpaRego(manifest);
+      } else if (format === "compliance-report") {
+        const findings = await storage.getSecurityFindings(project.id);
+        output.complianceReport = generateComplianceReport(manifest, findings, {
+          name: project.name,
+          analyzedAt: new Date().toISOString(),
+        });
       } else if (format === "all") {
         output.agentsMd = generateAgentsMd(manifest);
         output.openapi = generateOpenAPISpec(manifest);
         output.policyMatrix = generatePolicyMatrix(manifest);
+        const findings = await storage.getSecurityFindings(project.id);
+        output.keycloakRealm = generateKeycloakRealm(manifest, findings);
+        output.opaRego = generateOpaRego(manifest);
+        output.complianceReport = generateComplianceReport(manifest, findings, {
+          name: project.name,
+          analyzedAt: new Date().toISOString(),
+        });
       }
 
       res.json(output);
@@ -242,6 +263,18 @@ export async function registerRoutes(
       if (format === "agents-md" || format === "all") output.agentsMd = generateAgentsMd(manifest);
       if (format === "openapi" || format === "all") output.openapi = generateOpenAPISpec(manifest);
       if (format === "policy-matrix" || format === "all") output.policyMatrix = generatePolicyMatrix(manifest);
+      if (format === "keycloak-realm" || format === "all") {
+        const findings = await storage.getSecurityFindings(project.id);
+        output.keycloakRealm = generateKeycloakRealm(manifest, findings);
+      }
+      if (format === "opa-rego" || format === "all") output.opaRego = generateOpaRego(manifest);
+      if (format === "compliance-report" || format === "all") {
+        const findings = await storage.getSecurityFindings(project.id);
+        output.complianceReport = generateComplianceReport(manifest, findings, {
+          name: project.name,
+          analyzedAt: new Date().toISOString(),
+        });
+      }
 
       res.json(output);
     } catch (error) {
@@ -980,20 +1013,62 @@ export async function registerRoutes(
           res.setHeader("Content-Disposition", `attachment; filename="policy-matrix.json"`);
           return res.json(policyMatrix);
 
+        case "keycloak-realm": {
+          const findings = await storage.getSecurityFindings(projectId);
+          const keycloakRealm = generateKeycloakRealm(manifest, findings);
+          res.setHeader("Content-Type", "application/json");
+          res.setHeader("Content-Disposition", `attachment; filename="keycloak-realm-export.json"`);
+          return res.json(keycloakRealm);
+        }
+
+        case "opa-rego": {
+          const regoResult = generateOpaRego(manifest);
+          if (req.query.bundle === "true") {
+            res.setHeader("Content-Type", "application/json");
+            res.setHeader("Content-Disposition", `attachment; filename="opa-bundle.json"`);
+            return res.json(regoResult.bundle);
+          }
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.setHeader("Content-Disposition", `attachment; filename="policy.rego"`);
+          return res.send(regoResult.policy);
+        }
+
+        case "compliance-report": {
+          const reportFindings = await storage.getSecurityFindings(projectId);
+          const reportHtml = generateComplianceReport(manifest, reportFindings, {
+            name: project!.name,
+            analyzedAt: project!.createdAt?.toISOString() || new Date().toISOString(),
+          });
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.setHeader("Content-Disposition", `attachment; filename="compliance-report.html"`);
+          return res.send(reportHtml);
+        }
+
         case "all": {
           const allAgentsMd = generateAgentsMd(manifest);
           const allOpenapi = generateOpenAPISpec(manifest);
           const allPolicyMatrix = generatePolicyMatrix(manifest);
+          const allFindings = await storage.getSecurityFindings(projectId);
+          const allKeycloakRealm = generateKeycloakRealm(manifest, allFindings);
+          const allOpaRego = generateOpaRego(manifest);
+          const allComplianceReport = generateComplianceReport(manifest, allFindings, {
+            name: project!.name,
+            analyzedAt: project!.createdAt?.toISOString() || new Date().toISOString(),
+          });
           return res.json({
             manifest,
             agentsMd: allAgentsMd,
             openapi: allOpenapi,
             policyMatrix: allPolicyMatrix,
+            keycloakRealm: allKeycloakRealm,
+            opaRego: allOpaRego.policy,
+            opaBundleData: allOpaRego.bundle.data,
+            complianceReport: allComplianceReport,
           });
         }
 
         default:
-          return res.status(400).json({ message: `Unknown format: ${format}. Use: manifest, agents-md, openapi, policy-matrix, all` });
+          return res.status(400).json({ message: `Unknown format: ${format}. Use: manifest, agents-md, openapi, policy-matrix, keycloak-realm, opa-rego, compliance-report, all` });
       }
     } catch (error) {
       console.error("Error generating manifest:", error);
