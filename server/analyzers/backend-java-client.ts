@@ -159,7 +159,7 @@ async function callJavaEngine(
   return result;
 }
 
-function reconstructGraph(result: JavaEngineResult): ApplicationGraph {
+export function reconstructGraph(result: JavaEngineResult): ApplicationGraph {
   const graph = new ApplicationGraph();
 
   for (const n of result.nodes) {

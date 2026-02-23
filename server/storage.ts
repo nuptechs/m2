@@ -30,10 +30,12 @@ export interface IStorage {
   getProject(id: number): Promise<Project | undefined>;
   createProject(project: InsertProject): Promise<Project>;
   updateProjectStatus(id: number, status: string, fileCount?: number): Promise<void>;
+  updateProjectGitConfig(id: number, config: { gitProvider: string; gitRepoUrl: string; gitDefaultBranch: string; gitTokenRef: string }): Promise<void>;
   deleteProject(id: number): Promise<void>;
 
   getSourceFiles(projectId: number): Promise<SourceFile[]>;
   createSourceFile(file: InsertSourceFile): Promise<SourceFile>;
+  deleteSourceFilesByProject(projectId: number): Promise<void>;
 
   getAnalysisRuns(projectId: number): Promise<AnalysisRun[]>;
   getRecentAnalysisRuns(): Promise<AnalysisRun[]>;
@@ -97,6 +99,15 @@ export class DatabaseStorage implements IStorage {
     await db.update(projects).set(updates).where(eq(projects.id, id));
   }
 
+  async updateProjectGitConfig(id: number, config: { gitProvider: string; gitRepoUrl: string; gitDefaultBranch: string; gitTokenRef: string }): Promise<void> {
+    await db.update(projects).set({
+      gitProvider: config.gitProvider,
+      gitRepoUrl: config.gitRepoUrl,
+      gitDefaultBranch: config.gitDefaultBranch,
+      gitTokenRef: config.gitTokenRef,
+    }).where(eq(projects.id, id));
+  }
+
   async deleteProject(id: number): Promise<void> {
     await db.delete(projects).where(eq(projects.id, id));
   }
@@ -108,6 +119,10 @@ export class DatabaseStorage implements IStorage {
   async createSourceFile(file: InsertSourceFile): Promise<SourceFile> {
     const [created] = await db.insert(sourceFiles).values(file).returning();
     return created;
+  }
+
+  async deleteSourceFilesByProject(projectId: number): Promise<void> {
+    await db.delete(sourceFiles).where(eq(sourceFiles.projectId, projectId));
   }
 
   async getAnalysisRuns(projectId: number): Promise<AnalysisRun[]> {

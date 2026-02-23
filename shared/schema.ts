@@ -23,6 +23,10 @@ export const projects = pgTable("projects", {
   description: text("description"),
   status: text("status").notNull().default("pending"),
   fileCount: integer("file_count").default(0),
+  gitProvider: text("git_provider"),
+  gitRepoUrl: text("git_repo_url"),
+  gitDefaultBranch: text("git_default_branch"),
+  gitTokenRef: text("git_token_ref"),
   createdAt: timestamp("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
@@ -32,6 +36,21 @@ export const insertProjectSchema = createInsertSchema(projects).omit({
   status: true,
   fileCount: true,
 });
+
+export const connectGitSchema = z.object({
+  provider: z.enum(["github", "gitlab"]),
+  repoUrl: z.string().url(),
+  token: z.string().min(1),
+  defaultBranch: z.string().optional(),
+});
+
+export type ConnectGitInput = z.infer<typeof connectGitSchema>;
+
+export const analyzePRSchema = z.object({
+  prNumber: z.number().int().positive(),
+});
+
+export type AnalyzePRInput = z.infer<typeof analyzePRSchema>;
 
 export type Project = typeof projects.$inferSelect;
 export type InsertProject = z.infer<typeof insertProjectSchema>;

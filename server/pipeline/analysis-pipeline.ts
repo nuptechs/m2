@@ -1,10 +1,12 @@
 import { storage } from "../storage";
 import { analyzeFrontend } from "../analyzers/frontend-analyzer";
-import { buildApplicationGraph, analyzeGraphEndpoints } from "../analyzers/backend-java-client";
+import { buildApplicationGraph, analyzeGraphEndpoints, reconstructGraph } from "../analyzers/backend-java-client";
 import { interactionsToCatalogEntries, endpointImpactsToCatalogEntries } from "../analyzers/graph-connector";
 import { classifyEntriesDeterministic } from "../analyzers/deterministic-classifier";
 import { detectArchitecture } from "../analyzers/architecture-detector";
 import { generateManifest } from "../generators/manifest-generator";
+import { computeFileHashes, detectChanges } from "./change-detector";
+import type { FileHash } from "./change-detector";
 import type { InsertCatalogEntry } from "@shared/schema";
 
 export interface FileData {
@@ -47,6 +49,31 @@ export interface AnalysisResult {
     persistenceOperations: string[];
   }[];
   resolutionErrors?: string[];
+  cacheStatus?: string;
+}
+
+interface GraphCache {
+  graphJson: any;
+  endpointImpacts: any[];
+  archType: string;
+  resolutionErrors: string[];
+  fileHashes: FileHash[];
+  timestamp: number;
+}
+
+interface FrontendCache {
+  interactions: any[];
+  fileHashes: FileHash[];
+  timestamp: number;
+}
+
+const graphCacheStore = new Map<number, GraphCache>();
+const frontendCacheStore = new Map<number, FrontendCache>();
+
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+function isCacheValid(timestamp: number): boolean {
+  return Date.now() - timestamp < CACHE_TTL_MS;
 }
 
 export class AnalysisPipeline {
@@ -68,11 +95,72 @@ export class AnalysisPipeline {
       await storage.updateAnalysisRun(analysisRun.id, { status: "analyzing" });
       await storage.deleteCatalogEntriesByProject(projectId);
 
-      const { appGraph, resolutionErrors, archResult } = await this.buildGraph(fileData);
-      const endpointImpacts = this.analyzeEndpoints(appGraph);
-      const frontendInteractions = this.analyzeFrontendInteractions(fileData, appGraph);
+      const javaFiles = fileData.filter(f => f.filePath.endsWith(".java"));
+      const frontendFiles = fileData.filter(f => !f.filePath.endsWith(".java"));
+
+      const cachedGraph = graphCacheStore.get(projectId);
+      const cachedFrontend = frontendCacheStore.get(projectId);
+
+      let backendReused = false;
+      let frontendReused = false;
+      let appGraph: any;
+      let resolutionErrors: string[] = [];
+      let archType: string = "UNKNOWN";
+      let endpointImpacts: any[] = [];
+      let frontendInteractions: any[] = [];
+
+      if (cachedGraph && isCacheValid(cachedGraph.timestamp)) {
+        const javaHashes = computeFileHashes(javaFiles);
+        const changes = detectChanges(cachedGraph.fileHashes, javaFiles);
+        if (changes.noChanges || (!changes.backendChanged && javaFiles.length > 0)) {
+          this.progress("Step 1/4", `Backend graph cache HIT — ${cachedGraph.graphJson.nodes.length} nodes, ${cachedGraph.graphJson.edges.length} edges (no Java changes)`);
+          appGraph = reconstructGraph(cachedGraph.graphJson);
+          resolutionErrors = cachedGraph.resolutionErrors;
+          archType = cachedGraph.archType;
+          endpointImpacts = cachedGraph.endpointImpacts;
+          backendReused = true;
+        }
+      }
+
+      if (!backendReused) {
+        const result = await this.buildGraph(fileData);
+        appGraph = result.appGraph;
+        resolutionErrors = result.resolutionErrors;
+        archType = result.archResult.type;
+        endpointImpacts = this.analyzeEndpoints(appGraph);
+
+        const graphJson = appGraph.toJSON();
+        graphCacheStore.set(projectId, {
+          graphJson,
+          endpointImpacts,
+          archType,
+          resolutionErrors,
+          fileHashes: computeFileHashes(javaFiles),
+          timestamp: Date.now(),
+        });
+      }
+
+      if (cachedFrontend && isCacheValid(cachedFrontend.timestamp)) {
+        const feChanges = detectChanges(cachedFrontend.fileHashes, frontendFiles);
+        if (feChanges.noChanges && !feChanges.frontendChanged) {
+          this.progress("Step 3/4", `Frontend cache HIT — ${cachedFrontend.interactions.length} interactions (no frontend changes)`);
+          frontendInteractions = cachedFrontend.interactions;
+          frontendReused = true;
+        }
+      }
+
+      if (!frontendReused) {
+        frontendInteractions = this.analyzeFrontendInteractions(fileData, appGraph);
+
+        frontendCacheStore.set(projectId, {
+          interactions: frontendInteractions,
+          fileHashes: computeFileHashes(frontendFiles),
+          timestamp: Date.now(),
+        });
+      }
+
       let catalogEntryData = this.connectGraph(
-        frontendInteractions, endpointImpacts, appGraph, analysisRun.id, projectId, archResult.type
+        frontendInteractions, endpointImpacts, appGraph, analysisRun.id, projectId, archType
       );
       catalogEntryData = this.classify(catalogEntryData);
       const created = await this.persist(catalogEntryData);
@@ -81,10 +169,18 @@ export class AnalysisPipeline {
       await this.finalize(analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length, appGraph);
       await this.saveSnapshot(analysisRun.id, projectId, created);
 
-      return this.buildResult(
+      let cacheStatus = "full analysis";
+      if (backendReused && frontendReused) cacheStatus = "fully cached (no changes)";
+      else if (backendReused) cacheStatus = "backend cached, frontend re-analyzed";
+      else if (frontendReused) cacheStatus = "frontend cached, backend re-analyzed";
+
+      this.progress("Cache", cacheStatus);
+
+      const result = this.buildResult(
         analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length,
         appGraph, graphSummary, created.length, endpointImpacts, resolutionErrors
       );
+      return { ...result, cacheStatus };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : "Analysis failed";
       await storage.updateAnalysisRun(analysisRun.id, {
@@ -234,4 +330,20 @@ export class AnalysisPipeline {
       resolutionErrors: resolutionErrors.length > 0 ? resolutionErrors : undefined,
     };
   }
+}
+
+export function clearProjectCache(projectId: number): void {
+  graphCacheStore.delete(projectId);
+  frontendCacheStore.delete(projectId);
+}
+
+export function getCacheStats(): { graphCacheSize: number; frontendCacheSize: number; projects: number[] } {
+  const projects = new Set<number>();
+  graphCacheStore.forEach((_, k) => projects.add(k));
+  frontendCacheStore.forEach((_, k) => projects.add(k));
+  return {
+    graphCacheSize: graphCacheStore.size,
+    frontendCacheSize: frontendCacheStore.size,
+    projects: Array.from(projects),
+  };
 }

@@ -885,6 +885,334 @@ export async function registerRoutes(
     }
   });
 
+  const gitTokens = new Map<string, string>();
+
+  app.post("/api/projects/:projectId/git/connect", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const { connectGitSchema } = await import("@shared/schema");
+      const parsed = connectGitSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid input", errors: parsed.error.flatten() });
+      }
+
+      const { provider, repoUrl, token, defaultBranch } = parsed.data;
+
+      const { createGitProvider } = await import("./git/git-provider");
+      const gitProvider = await createGitProvider({ provider, repoUrl, token });
+
+      const branches = await gitProvider.fetchBranches();
+      const resolvedDefault = defaultBranch || branches.find(b => b.isDefault)?.name || "main";
+
+      const tokenRef = `git-token-${projectId}`;
+      gitTokens.set(tokenRef, token);
+
+      await storage.updateProjectGitConfig(projectId, {
+        gitProvider: provider,
+        gitRepoUrl: repoUrl,
+        gitDefaultBranch: resolvedDefault,
+        gitTokenRef: tokenRef,
+      });
+
+      res.json({
+        message: "Git repository connected",
+        provider,
+        repoUrl,
+        defaultBranch: resolvedDefault,
+        branchCount: branches.length,
+        branches: branches.map(b => b.name),
+      });
+    } catch (error) {
+      console.error("Error connecting git:", error);
+      const msg = error instanceof Error ? error.message : "Git connection failed";
+      res.status(500).json({ message: msg });
+    }
+  });
+
+  app.get("/api/projects/:projectId/git/branches", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      if (!project.gitProvider || !project.gitRepoUrl || !project.gitTokenRef) {
+        return res.status(400).json({ message: "Project is not connected to a Git repository" });
+      }
+
+      const token = gitTokens.get(project.gitTokenRef);
+      if (!token) return res.status(400).json({ message: "Git token not found. Please reconnect the repository." });
+
+      const { createGitProvider } = await import("./git/git-provider");
+      const gitProvider = await createGitProvider({
+        provider: project.gitProvider as "github" | "gitlab",
+        repoUrl: project.gitRepoUrl,
+        token,
+      });
+
+      const branches = await gitProvider.fetchBranches();
+      res.json(branches);
+    } catch (error) {
+      console.error("Error fetching branches:", error);
+      res.status(500).json({ message: "Failed to fetch branches" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/git/pull-requests", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      if (!project.gitProvider || !project.gitRepoUrl || !project.gitTokenRef) {
+        return res.status(400).json({ message: "Project is not connected to a Git repository" });
+      }
+
+      const token = gitTokens.get(project.gitTokenRef);
+      if (!token) return res.status(400).json({ message: "Git token not found. Please reconnect the repository." });
+
+      const { createGitProvider } = await import("./git/git-provider");
+      const gitProvider = await createGitProvider({
+        provider: project.gitProvider as "github" | "gitlab",
+        repoUrl: project.gitRepoUrl,
+        token,
+      });
+
+      const state = (req.query.state as string) || "open";
+      const prs = await gitProvider.fetchPullRequests(state as any);
+      res.json(prs);
+    } catch (error) {
+      console.error("Error fetching PRs:", error);
+      res.status(500).json({ message: "Failed to fetch pull requests" });
+    }
+  });
+
+  app.post("/api/projects/:projectId/analyze-branch", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      if (!project.gitProvider || !project.gitRepoUrl || !project.gitTokenRef) {
+        return res.status(400).json({ message: "Project is not connected to a Git repository" });
+      }
+
+      const token = gitTokens.get(project.gitTokenRef);
+      if (!token) return res.status(400).json({ message: "Git token not found. Please reconnect the repository." });
+
+      const branch = req.body.branch || project.gitDefaultBranch;
+
+      const { createGitProvider } = await import("./git/git-provider");
+      const gitProvider = await createGitProvider({
+        provider: project.gitProvider as "github" | "gitlab",
+        repoUrl: project.gitRepoUrl,
+        token,
+      });
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+
+      const sendEvent = (data: any) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      sendEvent({ step: "Fetching", detail: `Fetching source files from ${project.gitProvider} branch: ${branch}...` });
+
+      const files = await gitProvider.fetchFiles(branch);
+      sendEvent({ step: "Fetching", detail: `Fetched ${files.length} source files` });
+
+      await storage.deleteCatalogEntriesByProject(projectId);
+      await storage.deleteSourceFilesByProject(projectId);
+
+      for (const file of files) {
+        const fileType = getFileType(file.filePath);
+        await storage.createSourceFile({
+          projectId,
+          filePath: file.filePath,
+          fileType,
+          content: file.content,
+          contentHash: crypto.createHash("sha256").update(file.content).digest("hex"),
+        });
+      }
+      await storage.updateProjectStatus(projectId, "uploaded", files.length);
+
+      const pipeline = new AnalysisPipeline((progress) => {
+        sendEvent(progress);
+      });
+
+      const result = await pipeline.runFullAnalysis(projectId, files);
+
+      sendEvent({ step: "Complete", detail: "Analysis complete", result });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch (error) {
+      console.error("Error analyzing branch:", error);
+      const msg = error instanceof Error ? error.message : "Branch analysis failed";
+      if (!res.headersSent) {
+        res.status(500).json({ message: msg });
+      } else {
+        res.write(`data: ${JSON.stringify({ step: "Error", detail: msg })}\n\n`);
+        res.end();
+      }
+    }
+  });
+
+  app.post("/api/projects/:projectId/analyze-pr", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      if (!project.gitProvider || !project.gitRepoUrl || !project.gitTokenRef) {
+        return res.status(400).json({ message: "Project is not connected to a Git repository" });
+      }
+
+      const token = gitTokens.get(project.gitTokenRef);
+      if (!token) return res.status(400).json({ message: "Git token not found. Please reconnect the repository." });
+
+      const { analyzePRSchema } = await import("@shared/schema");
+      const parsed = analyzePRSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid input", errors: parsed.error.flatten() });
+      }
+
+      const { prNumber } = parsed.data;
+
+      const { createGitProvider } = await import("./git/git-provider");
+      const gitProvider = await createGitProvider({
+        provider: project.gitProvider as "github" | "gitlab",
+        repoUrl: project.gitRepoUrl,
+        token,
+      });
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+
+      const sendEvent = (data: any) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      sendEvent({ step: "PR Diff", detail: `Fetching PR #${prNumber} diff from ${project.gitProvider}...` });
+
+      const prDiff = await gitProvider.fetchPRDiff(prNumber);
+      sendEvent({
+        step: "PR Diff",
+        detail: `PR "${prDiff.pullRequest.title}" — ${prDiff.changedFiles.length} changed files (${prDiff.pullRequest.sourceBranch} → ${prDiff.pullRequest.targetBranch})`,
+      });
+
+      sendEvent({ step: "Base Analysis", detail: `Analyzing base branch (${prDiff.pullRequest.targetBranch}) — ${prDiff.baseFiles.length} files...` });
+      const basePipeline = new AnalysisPipeline((progress) => {
+        sendEvent({ ...progress, step: `Base: ${progress.step}` });
+      });
+      const baseResult = await basePipeline.runFullAnalysis(projectId, prDiff.baseFiles);
+      sendEvent({ step: "Base Analysis", detail: `Base analysis complete — ${baseResult.catalogEntries} entries` });
+
+      sendEvent({ step: "Head Analysis", detail: `Analyzing PR branch (${prDiff.pullRequest.sourceBranch}) — ${prDiff.headFiles.length} files...` });
+      const headPipeline = new AnalysisPipeline((progress) => {
+        sendEvent({ ...progress, step: `Head: ${progress.step}` });
+      });
+      const headResult = await headPipeline.runFullAnalysis(projectId, prDiff.headFiles);
+      sendEvent({ step: "Head Analysis", detail: `Head analysis complete — ${headResult.catalogEntries} entries` });
+
+      sendEvent({ step: "Diff", detail: "Computing manifest diff between base and head..." });
+      const snapshots = await storage.getAnalysisSnapshots(projectId);
+      const sortedSnapshots = snapshots.sort((a, b) => a.id - b.id);
+      const baseSnapshot = sortedSnapshots[sortedSnapshots.length - 2];
+      const headSnapshot = sortedSnapshots[sortedSnapshots.length - 1];
+
+      let diff = null;
+      if (baseSnapshot && headSnapshot) {
+        const { diffManifests } = await import("./diff/manifest-diff-engine");
+        diff = diffManifests(
+          baseSnapshot.manifestJson as any,
+          headSnapshot.manifestJson as any,
+          `Run #${baseSnapshot.analysisRunId} (${prDiff.pullRequest.targetBranch})`,
+          `Run #${headSnapshot.analysisRunId} (${prDiff.pullRequest.sourceBranch})`
+        );
+      }
+
+      const prReport = {
+        pullRequest: prDiff.pullRequest,
+        changedFiles: prDiff.changedFiles,
+        baseResult: { catalogEntries: baseResult.catalogEntries, endpoints: baseResult.totalEndpoints, interactions: baseResult.totalInteractions },
+        headResult: { catalogEntries: headResult.catalogEntries, endpoints: headResult.totalEndpoints, interactions: headResult.totalInteractions },
+        diff,
+      };
+
+      sendEvent({ step: "Complete", detail: "PR analysis complete", result: prReport });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch (error) {
+      console.error("Error analyzing PR:", error);
+      const msg = error instanceof Error ? error.message : "PR analysis failed";
+      if (!res.headersSent) {
+        res.status(500).json({ message: msg });
+      } else {
+        res.write(`data: ${JSON.stringify({ step: "Error", detail: msg })}\n\n`);
+        res.end();
+      }
+    }
+  });
+
+  app.get("/api/projects/:projectId/git/status", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      res.json({
+        connected: !!(project.gitProvider && project.gitRepoUrl),
+        provider: project.gitProvider || null,
+        repoUrl: project.gitRepoUrl || null,
+        defaultBranch: project.gitDefaultBranch || null,
+        tokenAvailable: project.gitTokenRef ? gitTokens.has(project.gitTokenRef) : false,
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to get git status" });
+    }
+  });
+
+  app.delete("/api/projects/:projectId/git/disconnect", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      if (project.gitTokenRef) {
+        gitTokens.delete(project.gitTokenRef);
+      }
+
+      await storage.updateProjectGitConfig(projectId, {
+        gitProvider: "",
+        gitRepoUrl: "",
+        gitDefaultBranch: "",
+        gitTokenRef: "",
+      });
+
+      res.json({ message: "Git repository disconnected" });
+    } catch (error) {
+      res.status(500).json({ message: "Failed to disconnect git" });
+    }
+  });
+
   app.post("/api/enrich-with-llm/:projectId", async (req, res) => {
     try {
       const projectId = parseInt(req.params.projectId);
