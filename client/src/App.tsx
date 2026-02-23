@@ -12,6 +12,7 @@ import Dashboard from "@/pages/dashboard";
 import UploadPage from "@/pages/upload";
 import CatalogPage from "@/pages/catalog";
 import InsightsPage from "@/pages/insights";
+import DiffViewerPage from "@/pages/diff-viewer";
 
 function Router() {
   return (
@@ -20,6 +21,7 @@ function Router() {
       <Route path="/upload" component={UploadPage} />
       <Route path="/catalog" component={CatalogPage} />
       <Route path="/insights" component={InsightsPage} />
+      <Route path="/diff" component={DiffViewerPage} />
       <Route component={NotFound} />
     </Switch>
   );

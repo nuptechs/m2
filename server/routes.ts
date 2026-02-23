@@ -804,6 +804,87 @@ export async function registerRoutes(
     }
   });
 
+  app.get("/api/projects/:projectId/diff", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const runAId = parseInt(req.query.runA as string);
+      const runBId = parseInt(req.query.runB as string);
+      if (isNaN(runAId) || isNaN(runBId)) {
+        return res.status(400).json({ message: "Both runA and runB query parameters are required (analysis run IDs)" });
+      }
+
+      const snapshotA = await storage.getAnalysisSnapshot(runAId);
+      const snapshotB = await storage.getAnalysisSnapshot(runBId);
+
+      if (!snapshotA) return res.status(404).json({ message: `No snapshot found for run ${runAId}. Only runs completed after snapshot feature was enabled have snapshots.` });
+      if (!snapshotB) return res.status(404).json({ message: `No snapshot found for run ${runBId}` });
+
+      const { diffManifests } = await import("./diff/manifest-diff-engine");
+      const diff = diffManifests(
+        snapshotA.manifestJson as any,
+        snapshotB.manifestJson as any,
+        runAId,
+        runBId
+      );
+
+      res.json(diff);
+    } catch (error) {
+      console.error("Error computing diff:", error);
+      res.status(500).json({ message: "Failed to compute manifest diff" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/diff/latest", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const snapshots = await storage.getLastTwoSnapshots(projectId);
+      if (snapshots.length < 2) {
+        return res.status(400).json({
+          message: `Need at least 2 analysis runs with snapshots to compute a diff. Found: ${snapshots.length}. Run analysis again to create more snapshots.`,
+          snapshotCount: snapshots.length,
+        });
+      }
+
+      const [newer, older] = snapshots;
+      const { diffManifests } = await import("./diff/manifest-diff-engine");
+      const diff = diffManifests(
+        older.manifestJson as any,
+        newer.manifestJson as any,
+        older.analysisRunId,
+        newer.analysisRunId
+      );
+
+      res.json(diff);
+    } catch (error) {
+      console.error("Error computing latest diff:", error);
+      res.status(500).json({ message: "Failed to compute latest manifest diff" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/snapshots", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+
+      const snapshots = await storage.getAnalysisSnapshots(projectId);
+      const summaries = snapshots.map(s => ({
+        id: s.id,
+        analysisRunId: s.analysisRunId,
+        createdAt: s.createdAt,
+        summary: (s.manifestJson as any)?.summary || null,
+      }));
+
+      res.json(summaries);
+    } catch (error) {
+      console.error("Error fetching snapshots:", error);
+      res.status(500).json({ message: "Failed to fetch snapshots" });
+    }
+  });
+
   app.post("/api/enrich-with-llm/:projectId", async (req, res) => {
     try {
       const projectId = parseInt(req.params.projectId);

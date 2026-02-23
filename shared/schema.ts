@@ -42,6 +42,7 @@ export const sourceFiles = pgTable("source_files", {
   filePath: text("file_path").notNull(),
   fileType: text("file_type").notNull(),
   content: text("content").notNull(),
+  contentHash: text("content_hash"),
   createdAt: timestamp("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
@@ -123,6 +124,22 @@ export const insertCatalogEntrySchema = createInsertSchema(catalogEntries).omit(
 
 export type CatalogEntry = typeof catalogEntries.$inferSelect;
 export type InsertCatalogEntry = z.infer<typeof insertCatalogEntrySchema>;
+
+export const analysisSnapshots = pgTable("analysis_snapshots", {
+  id: serial("id").primaryKey(),
+  analysisRunId: integer("analysis_run_id").notNull().references(() => analysisRuns.id, { onDelete: "cascade" }),
+  projectId: integer("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  manifestJson: jsonb("manifest_json").notNull(),
+  createdAt: timestamp("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
+export const insertAnalysisSnapshotSchema = createInsertSchema(analysisSnapshots).omit({
+  id: true,
+  createdAt: true,
+});
+
+export type AnalysisSnapshot = typeof analysisSnapshots.$inferSelect;
+export type InsertAnalysisSnapshot = z.infer<typeof insertAnalysisSnapshotSchema>;
 
 export const technicalOperations = [
   "READ",

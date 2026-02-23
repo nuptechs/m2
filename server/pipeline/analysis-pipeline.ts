@@ -4,6 +4,7 @@ import { buildApplicationGraph, analyzeGraphEndpoints } from "../analyzers/backe
 import { interactionsToCatalogEntries, endpointImpactsToCatalogEntries } from "../analyzers/graph-connector";
 import { classifyEntriesDeterministic } from "../analyzers/deterministic-classifier";
 import { detectArchitecture } from "../analyzers/architecture-detector";
+import { generateManifest } from "../generators/manifest-generator";
 import type { InsertCatalogEntry } from "@shared/schema";
 
 export interface FileData {
@@ -78,6 +79,7 @@ export class AnalysisPipeline {
 
       const graphSummary = appGraph.toJSON();
       await this.finalize(analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length, appGraph);
+      await this.saveSnapshot(analysisRun.id, projectId, created);
 
       return this.buildResult(
         analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length,
@@ -164,6 +166,22 @@ export class AnalysisPipeline {
 
   private async persist(entries: InsertCatalogEntry[]) {
     return storage.createCatalogEntries(entries);
+  }
+
+  private async saveSnapshot(analysisRunId: number, projectId: number, entries: any[]) {
+    try {
+      const project = await storage.getProject(projectId);
+      if (!project) return;
+      const manifest = generateManifest(project, entries);
+      await storage.createAnalysisSnapshot({
+        analysisRunId,
+        projectId,
+        manifestJson: manifest,
+      });
+      this.progress("Snapshot", `Manifest snapshot saved for run #${analysisRunId}`);
+    } catch (err) {
+      console.error(`[pipeline] Failed to save snapshot: ${err}`);
+    }
   }
 
   private async finalize(

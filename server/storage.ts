@@ -5,6 +5,7 @@ import {
   sourceFiles,
   analysisRuns,
   catalogEntries,
+  analysisSnapshots,
   type Project,
   type InsertProject,
   type SourceFile,
@@ -13,6 +14,8 @@ import {
   type InsertAnalysisRun,
   type CatalogEntry,
   type InsertCatalogEntry,
+  type AnalysisSnapshot,
+  type InsertAnalysisSnapshot,
   users,
   type User,
   type InsertUser,
@@ -44,6 +47,11 @@ export interface IStorage {
   updateCatalogEntry(id: number, data: Partial<CatalogEntry>): Promise<void>;
   deleteCatalogEntriesByRun(runId: number): Promise<void>;
   deleteCatalogEntriesByProject(projectId: number): Promise<void>;
+
+  createAnalysisSnapshot(snapshot: InsertAnalysisSnapshot): Promise<AnalysisSnapshot>;
+  getAnalysisSnapshot(analysisRunId: number): Promise<AnalysisSnapshot | undefined>;
+  getAnalysisSnapshots(projectId: number): Promise<AnalysisSnapshot[]>;
+  getLastTwoSnapshots(projectId: number): Promise<AnalysisSnapshot[]>;
 
   getStats(): Promise<{
     totalProjects: number;
@@ -155,6 +163,24 @@ export class DatabaseStorage implements IStorage {
 
   async deleteCatalogEntriesByProject(projectId: number): Promise<void> {
     await db.delete(catalogEntries).where(eq(catalogEntries.projectId, projectId));
+  }
+
+  async createAnalysisSnapshot(snapshot: InsertAnalysisSnapshot): Promise<AnalysisSnapshot> {
+    const [created] = await db.insert(analysisSnapshots).values(snapshot).returning();
+    return created;
+  }
+
+  async getAnalysisSnapshot(analysisRunId: number): Promise<AnalysisSnapshot | undefined> {
+    const [snapshot] = await db.select().from(analysisSnapshots).where(eq(analysisSnapshots.analysisRunId, analysisRunId));
+    return snapshot;
+  }
+
+  async getAnalysisSnapshots(projectId: number): Promise<AnalysisSnapshot[]> {
+    return db.select().from(analysisSnapshots).where(eq(analysisSnapshots.projectId, projectId)).orderBy(desc(analysisSnapshots.createdAt));
+  }
+
+  async getLastTwoSnapshots(projectId: number): Promise<AnalysisSnapshot[]> {
+    return db.select().from(analysisSnapshots).where(eq(analysisSnapshots.projectId, projectId)).orderBy(desc(analysisSnapshots.createdAt)).limit(2);
   }
 
   async getStats() {
