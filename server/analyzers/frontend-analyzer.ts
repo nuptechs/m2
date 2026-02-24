@@ -1089,6 +1089,87 @@ function buildHttpServiceMap(files: { filePath: string; content: string }[]): Ht
     }
   }
 
+  const reExportMappings: { fromFile: string; toFile: string; names: { localName: string; originalName: string }[] }[] = [];
+  for (const file of files) {
+    if (file.filePath.includes("node_modules") || file.filePath.includes("dist/") || file.filePath.includes("build/") || file.filePath.includes("__tests__")) continue;
+    const ext = file.filePath.substring(file.filePath.lastIndexOf("."));
+    if (![".ts", ".js", ".tsx", ".jsx"].includes(ext)) continue;
+    try {
+      const sourceFile = parseTypeScript(file.content, file.filePath);
+      const visitReExports = (node: ts.Node) => {
+        if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+          const resolvedTarget = normalizeModulePath(file.filePath, node.moduleSpecifier.text, allFilePaths);
+          if (resolvedTarget) {
+            const names: { localName: string; originalName: string }[] = [];
+            if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+              for (const spec of node.exportClause.elements) {
+                const localName = spec.name.text;
+                const originalName = spec.propertyName ? spec.propertyName.text : spec.name.text;
+                names.push({ localName, originalName });
+              }
+            } else if (!node.exportClause) {
+              names.push({ localName: "*", originalName: "*" });
+            }
+            if (names.length > 0) {
+              reExportMappings.push({ fromFile: file.filePath, toFile: resolvedTarget, names });
+            }
+          }
+        }
+        ts.forEachChild(node, visitReExports);
+      };
+      visitReExports(sourceFile);
+    } catch (err) {
+    }
+  }
+
+  for (const reExport of reExportMappings) {
+    const targetEntry = serviceMap.get(reExport.toFile);
+    if (!targetEntry) continue;
+
+    let sourceEntry = serviceMap.get(reExport.fromFile);
+    if (!sourceEntry) {
+      sourceEntry = { methods: new Map(), directFunctions: new Map() };
+    }
+
+    let added = false;
+    for (const nameMapping of reExport.names) {
+      if (nameMapping.localName === "*") {
+        for (const [fnName, httpCalls] of Array.from(targetEntry.directFunctions.entries())) {
+          if (!sourceEntry.directFunctions.has(fnName)) {
+            sourceEntry.directFunctions.set(fnName, httpCalls);
+            added = true;
+          }
+        }
+        for (const [methodKey, methodEntry] of Array.from(targetEntry.methods.entries())) {
+          if (!sourceEntry.methods.has(methodKey)) {
+            sourceEntry.methods.set(methodKey, methodEntry);
+            added = true;
+          }
+        }
+      } else {
+        const origName = nameMapping.originalName;
+        const localName = nameMapping.localName;
+        if (targetEntry.directFunctions.has(origName)) {
+          sourceEntry.directFunctions.set(localName, targetEntry.directFunctions.get(origName)!);
+          added = true;
+        }
+        for (const [methodKey, methodEntry] of Array.from(targetEntry.methods.entries())) {
+          if (methodKey === origName || methodKey.startsWith(origName + ".")) {
+            const newKey = methodKey === origName ? localName : localName + methodKey.substring(origName.length);
+            if (!sourceEntry.methods.has(newKey)) {
+              sourceEntry.methods.set(newKey, methodEntry);
+              added = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (added) {
+      serviceMap.set(reExport.fromFile, sourceEntry);
+    }
+  }
+
   for (const chain of inheritanceChains) {
     const parentEntry = serviceMap.get(chain.parentFilePath);
     if (!parentEntry) continue;
@@ -1391,19 +1472,20 @@ function buildGlobalCallGraph(files: { filePath: string; content: string }[], se
       };
       detectReactQueryHooks(sourceFile);
 
+      const hookResultVars = new Map<string, string>();
+
       const detectCustomHookReturns = (node: ts.Node) => {
         if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)) {
-          if (!ts.isObjectBindingPattern(node.name)) {
-            ts.forEachChild(node, detectCustomHookReturns);
-            return;
-          }
           const callExpr = node.initializer.expression;
           let hookName = "";
           let hookSourcePath = "";
           if (ts.isIdentifier(callExpr)) {
             hookName = callExpr.text;
           }
-          if (!hookName || !hookName.startsWith("use") || hookName === "useMutation" || hookName === "useQuery" || hookName === "useState" || hookName === "useEffect" || hookName === "useRef" || hookName === "useCallback" || hookName === "useMemo" || hookName === "useContext" || hookName === "useReducer" || hookName === "useNavigate" || hookName === "useLocation" || hookName === "useParams" || hookName === "useSearchParams") {
+
+          const isReactBuiltIn = !hookName || !hookName.startsWith("use") || hookName === "useMutation" || hookName === "useQuery" || hookName === "useState" || hookName === "useEffect" || hookName === "useRef" || hookName === "useCallback" || hookName === "useMemo" || hookName === "useContext" || hookName === "useReducer" || hookName === "useNavigate" || hookName === "useLocation" || hookName === "useParams" || hookName === "useSearchParams";
+
+          if (isReactBuiltIn) {
             ts.forEachChild(node, detectCustomHookReturns);
             return;
           }
@@ -1418,20 +1500,24 @@ function buildGlobalCallGraph(files: { filePath: string; content: string }[], se
             return;
           }
 
-          const destructuredNames: string[] = [];
-          for (const el of node.name.elements) {
-            if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
-              destructuredNames.push(el.name.text);
+          if (ts.isObjectBindingPattern(node.name)) {
+            const destructuredNames: string[] = [];
+            for (const el of node.name.elements) {
+              if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
+                destructuredNames.push(el.name.text);
+              }
             }
-          }
 
-          for (const dName of destructuredNames) {
-            const localKey = makeGlobalKey(file.filePath, dName);
-            const hookKey = makeGlobalKey(hookSourcePath, dName);
-            if (!graph.has(localKey)) {
-              graph.set(localKey, { key: localKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+            for (const dName of destructuredNames) {
+              const localKey = makeGlobalKey(file.filePath, dName);
+              const hookKey = makeGlobalKey(hookSourcePath, dName);
+              if (!graph.has(localKey)) {
+                graph.set(localKey, { key: localKey, filePath: file.filePath, functionName: dName, httpCalls: [], callees: new Set(), callers: new Set(), propagatedHttpCalls: null });
+              }
+              graph.get(localKey)!.callees.add(hookKey);
             }
-            graph.get(localKey)!.callees.add(hookKey);
+          } else if (ts.isIdentifier(node.name)) {
+            hookResultVars.set(node.name.text, hookSourcePath);
           }
         }
         ts.forEachChild(node, detectCustomHookReturns);
@@ -1508,6 +1594,11 @@ function buildGlobalCallGraph(files: { filePath: string; content: string }[], se
                     if (localFunctions.has(methodName)) {
                       gNode.callees.add(makeGlobalKey(file.filePath, methodName));
                     }
+                  }
+                  if (hookResultVars.has(objName)) {
+                    const hookSrcPath = hookResultVars.get(objName)!;
+                    gNode.callees.add(makeGlobalKey(hookSrcPath, methodName));
+                    gNode.callees.add(makeGlobalKey(hookSrcPath, "default." + methodName));
                   }
                 }
               }
@@ -1677,6 +1768,26 @@ function lookupGlobalCallGraph(
         if (importNode.propagatedHttpCalls && importNode.propagatedHttpCalls.length > 0) return importNode.propagatedHttpCalls;
         if (importNode.httpCalls.length > 0) return importNode.httpCalls;
       }
+    }
+  }
+
+  if (node && !node.propagatedHttpCalls && !node.httpCalls.length && node.callees.size > 0) {
+    const visited = new Set<string>();
+    const queue = Array.from(node.callees);
+    let depth = 0;
+    while (queue.length > 0 && depth < 3) {
+      const batch = [...queue];
+      queue.length = 0;
+      for (const k of batch) {
+        if (visited.has(k)) continue;
+        visited.add(k);
+        const callee = globalGraph.get(k);
+        if (!callee) continue;
+        if (callee.propagatedHttpCalls?.length) return callee.propagatedHttpCalls;
+        if (callee.httpCalls.length) return callee.httpCalls;
+        for (const ck of Array.from(callee.callees)) queue.push(ck);
+      }
+      depth++;
     }
   }
 
@@ -4546,6 +4657,7 @@ function tierToConfidence(tier: string | null): number {
     case "eventGraph+serviceMap": return 0.75;
     case "eventGraph+globalCallGraph": return 0.70;
     case "stateFlowGraph": return 0.65;
+    case "fuzzyGlobalMatch": return 0.45;
     case "architecturalLayerGraph": return 0.55;
     case "contextHook": return 0.90;
     case "dynamicImport": return 0.88;
@@ -4680,6 +4792,37 @@ function resolveHandlerHttpCalls(
       { tier: "local", file: filePath, function: handlerName, detail: "handler entry point" },
       { tier: "stateFlowGraph", file: filePath, function: handlerName, detail: "state write→read chain to HTTP-calling function" }
     ]);
+  }
+
+  if (globalCallGraph) {
+    const FUZZY_COMMON_NAMES = new Set(["load", "submit", "save", "delete", "update", "create", "get", "set", "fetch", "handle", "init", "reset", "close", "open", "toggle", "render", "refresh", "send", "remove", "add", "change", "click", "press"]);
+    const handlerNodeFuzzy = symbolTable.resolveHandlerNode(handlerName);
+    if (handlerNodeFuzzy) {
+      const declFuzzy = symbolTable.getDeclaration(handlerNodeFuzzy);
+      if (declFuzzy) {
+        for (const calledNode of declFuzzy.calledNodes) {
+          const calledDecl = symbolTable.getDeclaration(calledNode);
+          if (calledDecl && calledDecl.name.length >= 5 && !FUZZY_COMMON_NAMES.has(calledDecl.name.toLowerCase())) {
+            const candidates: { gNode: any; calls: any[] }[] = [];
+            for (const [, gNode] of Array.from(globalCallGraph)) {
+              if (gNode.functionName === calledDecl.name || gNode.functionName.endsWith("." + calledDecl.name)) {
+                const calls = gNode.propagatedHttpCalls || (gNode.httpCalls.length > 0 ? gNode.httpCalls : null);
+                if (calls && calls.length > 0) {
+                  candidates.push({ gNode, calls });
+                }
+              }
+            }
+            if (candidates.length === 1) {
+              const { gNode, calls } = candidates[0];
+              return tagResolution(calls, "fuzzyGlobalMatch", [
+                { tier: "local", file: filePath, function: handlerName, detail: "handler entry point" },
+                { tier: "fuzzyGlobalMatch", file: gNode.filePath, function: gNode.functionName, detail: "unique function name match across project" }
+              ]);
+            }
+          }
+        }
+      }
+    }
   }
 
   if (archLayerGraph) {
@@ -5260,6 +5403,7 @@ function extractJsxRoute(node: ts.JsxElement | ts.JsxSelfClosingElement, sourceF
   const attrs = ts.isJsxElement(node) ? node.openingElement.attributes : node.attributes;
   let path = "";
   let component = "";
+  let isIndex = false;
   const guards: string[] = [];
 
   for (const attr of attrs.properties) {
@@ -5270,6 +5414,16 @@ function extractJsxRoute(node: ts.JsxElement | ts.JsxSelfClosingElement, sourceF
           path = attr.initializer.text;
         } else if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression && ts.isStringLiteral(attr.initializer.expression)) {
           path = attr.initializer.expression.text;
+        }
+      }
+      if (attrName === "index" && !attr.initializer) {
+        isIndex = true;
+      }
+      if (attrName === "index" && attr.initializer) {
+        if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression) {
+          if (attr.initializer.expression.kind === ts.SyntaxKind.TrueKeyword) isIndex = true;
+        } else {
+          isIndex = true;
         }
       }
       if ((attrName === "element" || attrName === "component") && attr.initializer) {
@@ -5294,7 +5448,9 @@ function extractJsxRoute(node: ts.JsxElement | ts.JsxSelfClosingElement, sourceF
     }
   }
 
-  if (path) return { path, component, guards, children: childRoutes };
+  if (isIndex && !path) path = "";
+  if (path || isIndex) return { path, component, guards, children: childRoutes };
+  if (component && childRoutes.length > 0) return { path: "", component, guards, children: childRoutes };
   return null;
 }
 
@@ -5357,11 +5513,16 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
 
   const flatten = (routes: RouteDefinition[], parentPath: string = "", parentGuards: string[] = []) => {
     for (const route of routes) {
-      const fullPath = route.path.startsWith("/")
-        ? route.path
-        : parentPath.endsWith("/")
+      let fullPath: string;
+      if (route.path === "" || route.path === undefined) {
+        fullPath = parentPath || "/";
+      } else if (route.path.startsWith("/")) {
+        fullPath = route.path;
+      } else {
+        fullPath = parentPath.endsWith("/")
           ? parentPath + route.path
           : parentPath + "/" + route.path;
+      }
       const mergedGuards = [...parentGuards, ...route.guards];
       const componentName = route.component;
 
@@ -5370,6 +5531,10 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
         const baseName = normalizedName.split("/").pop() || normalizedName;
         routeMap.set(baseName.toLowerCase(), { route: fullPath, guards: mergedGuards });
         routeMap.set(normalizedName.toLowerCase(), { route: fullPath, guards: mergedGuards });
+        const pascalToKebab = baseName.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
+        if (pascalToKebab !== baseName.toLowerCase()) {
+          routeMap.set(pascalToKebab, { route: fullPath, guards: mergedGuards });
+        }
       }
 
       if (route.children && route.children.length > 0) {
@@ -5463,6 +5628,7 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
         const attrs = ts.isJsxElement(node) ? node.openingElement.attributes : node.attributes;
         let path = "";
         let component = "";
+        let isIndex = false;
         const guards: string[] = [];
 
         for (const attr of attrs.properties) {
@@ -5473,6 +5639,16 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
                 path = attr.initializer.text;
               } else if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression && ts.isStringLiteral(attr.initializer.expression)) {
                 path = attr.initializer.expression.text;
+              }
+            }
+            if (attrName === "index" && !attr.initializer) {
+              isIndex = true;
+            }
+            if (attrName === "index" && attr.initializer) {
+              if (ts.isJsxExpression(attr.initializer) && attr.initializer.expression) {
+                if (attr.initializer.expression.kind === ts.SyntaxKind.TrueKeyword) isIndex = true;
+              } else {
+                isIndex = true;
               }
             }
             if ((attrName === "element" || attrName === "component") && attr.initializer) {
@@ -5498,8 +5674,13 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
           }
         }
 
-        if (path) {
+        if (isIndex && !path) path = "";
+        if (path || isIndex) {
           routes.push({ path, component, guards, children: childRoutes });
+          return;
+        }
+        if (component && childRoutes.length > 0) {
+          routes.push({ path: "", component, guards, children: childRoutes });
           return;
         }
       }
@@ -5515,17 +5696,30 @@ function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): Rout
 function parseRouteObject(node: ts.ObjectLiteralExpression, sourceFile: ts.SourceFile): RouteDefinition | null {
   let path = "";
   let component = "";
+  let isIndex = false;
   const guards: string[] = [];
   const children: RouteDefinition[] = [];
 
   for (const prop of node.properties) {
-    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
+    if (!ts.isPropertyAssignment(prop) && !ts.isShorthandPropertyAssignment(prop)) {
+      if (ts.isPropertyAssignment(prop) || ts.isShorthandPropertyAssignment(prop)) continue;
+      continue;
+    }
+    if (ts.isShorthandPropertyAssignment(prop)) {
+      if (prop.name.text === "index") isIndex = true;
+      continue;
+    }
+    if (!ts.isIdentifier(prop.name)) continue;
     const name = prop.name.text;
 
     if (name === "path") {
       if (ts.isStringLiteral(prop.initializer) || ts.isNoSubstitutionTemplateLiteral(prop.initializer)) {
         path = prop.initializer.text;
       }
+    }
+
+    if (name === "index") {
+      if (prop.initializer.kind === ts.SyntaxKind.TrueKeyword) isIndex = true;
     }
 
     if (name === "component" || name === "element") {
@@ -5577,7 +5771,8 @@ function parseRouteObject(node: ts.ObjectLiteralExpression, sourceFile: ts.Sourc
     }
   }
 
-  if (!path && !component) return null;
+  if (isIndex && !path) path = "";
+  if (!path && !isIndex && !component) return null;
   return { path, component, guards, children };
 }
 
@@ -5790,31 +5985,59 @@ export function analyzeFrontend(
     let routeEnriched = 0;
     for (const interaction of interactions) {
       const componentName = interaction.component.toLowerCase();
-      const routeInfo = routeMap.get(componentName);
-      if (routeInfo) {
-        interaction.frontendRoute = routeInfo.route;
-        const existingGuards = interaction.routeGuards || [];
-        interaction.routeGuards = Array.from(new Set([...routeInfo.guards, ...existingGuards]));
-        routeEnriched++;
-      } else {
+      let matched = routeMap.get(componentName);
+      if (!matched) {
         const fileName = interaction.sourceFile
           .split("/").pop()
           ?.replace(/\.(vue|tsx|jsx|ts|js)$/, "")
           ?.toLowerCase();
-        if (fileName) {
-          const routeInfoByFile = routeMap.get(fileName);
-          if (routeInfoByFile) {
-            interaction.frontendRoute = routeInfoByFile.route;
-            const existingGuards = interaction.routeGuards || [];
-            interaction.routeGuards = Array.from(new Set([...routeInfoByFile.guards, ...existingGuards]));
-            routeEnriched++;
+        if (fileName) matched = routeMap.get(fileName);
+      }
+      if (!matched) {
+        const pathParts = interaction.sourceFile.replace(/\\/g, "/").split("/");
+        const srcIdx = pathParts.findIndex(p => p === "src" || p === "app" || p === "pages" || p === "views");
+        if (srcIdx >= 0) {
+          const relParts = pathParts.slice(srcIdx + 1);
+          const relPath = relParts.join("/").replace(/\.(vue|tsx|jsx|ts|js)$/, "").toLowerCase();
+          matched = routeMap.get(relPath);
+          if (!matched && relParts.length >= 2) {
+            const dirName = relParts[relParts.length - 2].toLowerCase();
+            matched = routeMap.get(dirName);
           }
         }
+      }
+      if (!matched && componentName.length >= 5) {
+        for (const [key, val] of Array.from(routeMap)) {
+          if (key === componentName) continue;
+          if (key.length < 5) continue;
+          if (key === componentName.replace(/page$/i, "") || key === componentName.replace(/view$/i, "") || key === componentName.replace(/screen$/i, "")) {
+            matched = val;
+            break;
+          }
+          if (componentName === key.replace(/page$/i, "") || componentName === key.replace(/view$/i, "") || componentName === key.replace(/screen$/i, "")) {
+            matched = val;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        interaction.frontendRoute = matched.route;
+        const existingGuards = interaction.routeGuards || [];
+        interaction.routeGuards = Array.from(new Set([...matched.guards, ...existingGuards]));
+        routeEnriched++;
       }
     }
     if (routeEnriched > 0) {
       console.log(`[frontend-analyzer] Route enrichment: ${routeEnriched}/${interactions.length} interactions mapped to routes`);
+    } else {
+      console.log(`[frontend-analyzer] Route enrichment: 0 matches. RouteMap has ${routeMap.size} entries. Sample components: ${interactions.slice(0, 5).map(i => i.component).join(", ")}`);
+      const routeEntries = Array.from(routeMap.entries()).slice(0, 5);
+      for (const [key, val] of routeEntries) {
+        console.log(`[frontend-analyzer]   RouteMap entry: "${key}" → "${val.route}"`);
+      }
     }
+  } else {
+    console.log(`[frontend-analyzer] Route enrichment skipped: no routes found in any file`);
   }
 
   const fileAuthCache = new Map<string, FileAuthPatterns>();

@@ -232,9 +232,7 @@ export function generateManifest(project: Project, entries: CatalogEntry[]): Per
   const interactionsWithEndpoint = entries.filter(e => e.endpoint).length;
   const endpointResolution = entries.length > 0 ? Math.round((interactionsWithEndpoint / entries.length) * 100) : 0;
 
-  const screensWithRoutes = allScreens.filter(s => {
-    return s.interactions.some(i => i.endpoint);
-  }).length;
+  const screensWithRoutes = allScreens.filter(s => s.route !== null && s.route !== undefined && s.route !== "").length;
   const routeCoverage = allScreens.length > 0 ? Math.round((screensWithRoutes / allScreens.length) * 100) : 0;
 
   const endpointsWithEntity = allEndpoints.filter(e => e.entitiesTouched.length > 0).length;
