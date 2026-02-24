@@ -154,7 +154,7 @@ export function generateComplianceReport(
     const c = manifest.completeness;
     if (!c) return "<p>Completeness metrics not available.</p>";
     const metrics = [
-      { label: "Endpoint Resolution", value: c.endpointResolution, desc: "Interactions with resolved HTTP endpoints" },
+      { label: "Endpoint Resolution", value: c.endpointResolution, desc: "HTTP-relevant interactions with resolved endpoints" },
       { label: "Route Coverage", value: c.routeCoverage, desc: "Screens with mapped frontend routes" },
       { label: "Security Coverage", value: c.securityCoverage, desc: "Endpoints with roles or guards" },
       { label: "Entity Coverage", value: c.entityCoverage, desc: "Endpoints with entity mappings" },
@@ -170,6 +170,16 @@ export function generateComplianceReport(
       </tr>`;
     }
     const overallColor = c.overallScore >= 80 ? "#22c55e" : c.overallScore >= 50 ? "#ca8a04" : "#dc2626";
+    const b = c.interactionBreakdown;
+    const breakdownHtml = b ? `
+    <h3>Interaction Breakdown</h3>
+    <div class="summary-grid" style="margin-bottom: 12px;">
+      <div class="summary-card"><div class="value">${b.total}</div><div class="label">Total Interactions</div></div>
+      <div class="summary-card"><div class="value">${b.withEndpoint}</div><div class="label">With HTTP Endpoint</div></div>
+      <div class="summary-card"><div class="value">${b.uiOnly}</div><div class="label">UI-Only (State/Nav)</div></div>
+      <div class="summary-card"><div class="value">${b.httpRelevant}</div><div class="label">HTTP-Relevant</div></div>
+      <div class="summary-card"><div class="value">${b.httpRelevantResolved}</div><div class="label">HTTP Resolved</div></div>
+    </div>` : "";
     return `<div class="summary-card" style="display: inline-block; margin-bottom: 16px;">
       <div class="value" style="color: ${overallColor}">${c.overallScore}%</div>
       <div class="label">Overall Completeness</div>
@@ -177,7 +187,8 @@ export function generateComplianceReport(
     <table>
       <thead><tr><th>Metric</th><th>Description</th><th>Coverage</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table>
+    ${breakdownHtml}`;
   };
 
   const renderChecklist = (): string => {

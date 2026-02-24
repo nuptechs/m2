@@ -1837,7 +1837,7 @@ function lookupGlobalCallGraph(
     const visited = new Set<string>();
     const queue = Array.from(node.callees);
     let depth = 0;
-    while (queue.length > 0 && depth < 3) {
+    while (queue.length > 0 && depth < 5) {
       const batch = [...queue];
       queue.length = 0;
       for (const k of batch) {
@@ -1853,11 +1853,39 @@ function lookupGlobalCallGraph(
     }
   }
 
+  if (importBindings) {
+    const binding = importBindings.get(handlerName);
+    if (binding) {
+      const altKeys = [
+        makeGlobalKey(binding.sourcePath, handlerName),
+        makeGlobalKey(binding.sourcePath, "default"),
+      ];
+      for (const altKey of altKeys) {
+        const altNode = globalGraph.get(altKey);
+        if (altNode) {
+          if (altNode.propagatedHttpCalls?.length) return altNode.propagatedHttpCalls;
+          if (altNode.httpCalls.length > 0) return altNode.httpCalls;
+        }
+      }
+    }
+  }
+
   const allNodes = Array.from(globalGraph.values());
   for (const gNode of allNodes) {
     if (gNode.filePath === filePath && gNode.functionName.endsWith("." + handlerName)) {
       if (gNode.propagatedHttpCalls && gNode.propagatedHttpCalls.length > 0) return gNode.propagatedHttpCalls;
       if (gNode.httpCalls.length > 0) return gNode.httpCalls;
+    }
+  }
+
+  if (importBindings) {
+    for (const [importName, binding] of Array.from(importBindings.entries())) {
+      if (importName === handlerName) continue;
+      const srcNode = globalGraph.get(makeGlobalKey(binding.sourcePath, handlerName));
+      if (srcNode) {
+        if (srcNode.propagatedHttpCalls?.length) return srcNode.propagatedHttpCalls;
+        if (srcNode.httpCalls.length > 0) return srcNode.httpCalls;
+      }
     }
   }
 
@@ -4739,6 +4767,8 @@ function tierToConfidence(tier: string | null): number {
     case "eventGraph": return 0.80;
     case "eventGraph+serviceMap": return 0.75;
     case "eventGraph+globalCallGraph": return 0.70;
+    case "dispatchAction": return 0.82;
+    case "crossFileNameMatch": return 0.50;
     case "stateFlowGraph": return 0.65;
     case "architecturalLayerGraph": return 0.55;
     case "fuzzyGlobalMatch": return 0.45;
@@ -4996,6 +5026,40 @@ function resolveHandlerHttpCalls(
     }
   }
 
+  if (globalCallGraph && crossFileContext) {
+    const handlerNodeDispatch = symbolTable.resolveHandlerNode(handlerName);
+    if (handlerNodeDispatch) {
+      const dispatchCalls = extractDispatchedActions(handlerNodeDispatch, crossFileContext.sourceFile, crossFileContext.importBindings);
+      for (const actionName of dispatchCalls) {
+        const binding = crossFileContext.importBindings.get(actionName);
+        if (binding) {
+          const actionKey = makeGlobalKey(binding.sourcePath, binding.isDefault ? "default" : binding.originalName);
+          const actionNode = globalCallGraph.get(actionKey);
+          if (actionNode) {
+            const calls = actionNode.propagatedHttpCalls || (actionNode.httpCalls.length > 0 ? actionNode.httpCalls : null);
+            if (calls && calls.length > 0) {
+              return tagResolution(calls, "dispatchAction", [
+                { tier: "local", file: filePath, function: handlerName, detail: "handler dispatches action" },
+                { tier: "dispatchAction", file: binding.sourcePath, function: actionName, detail: "action creator contains HTTP call" }
+              ]);
+            }
+          }
+        }
+        const directKey = makeGlobalKey(filePath, actionName);
+        const directNode = globalCallGraph.get(directKey);
+        if (directNode) {
+          const calls = directNode.propagatedHttpCalls || (directNode.httpCalls.length > 0 ? directNode.httpCalls : null);
+          if (calls && calls.length > 0) {
+            return tagResolution(calls, "dispatchAction", [
+              { tier: "local", file: filePath, function: handlerName, detail: "handler dispatches action" },
+              { tier: "dispatchAction", file: filePath, function: actionName, detail: "local action function contains HTTP call" }
+            ]);
+          }
+        }
+      }
+    }
+  }
+
   if (archLayerGraph) {
     const importBindings = crossFileContext?.importBindings;
     const archCalls = lookupArchitecturalLayerGraph(archLayerGraph, filePath, handlerName, symbolTable, externalCalls, importBindings);
@@ -5075,6 +5139,22 @@ function resolveHandlerHttpCalls(
     }
   }
 
+  if (globalCallGraph) {
+    const allGcgNodes = Array.from(globalCallGraph.values());
+    for (const gNode of allGcgNodes) {
+      if (gNode.filePath === filePath) continue;
+      if (gNode.functionName === handlerName) {
+        const calls = gNode.propagatedHttpCalls || (gNode.httpCalls.length > 0 ? gNode.httpCalls : null);
+        if (calls && calls.length > 0) {
+          return tagResolution(calls, "crossFileNameMatch", [
+            { tier: "local", file: filePath, function: handlerName, detail: "handler entry point" },
+            { tier: "crossFileNameMatch", file: gNode.filePath, function: gNode.functionName, detail: "same-name function found in another file with HTTP calls" }
+          ]);
+        }
+      }
+    }
+  }
+
   return [];
 }
 
@@ -5082,6 +5162,42 @@ interface HookBinding {
   destructuredName: string;
   hookName: string;
   hookSourcePath: string;
+}
+
+function extractDispatchedActions(
+  handlerNode: ts.Node,
+  sourceFile: ts.SourceFile,
+  importBindings: Map<string, ImportBinding>
+): string[] {
+  const actions: string[] = [];
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n)) {
+      const callText = n.expression.getText(sourceFile);
+      if (callText === "dispatch" || callText === "store.dispatch" || callText === "this.store.dispatch" || callText === "this.$store.dispatch") {
+        for (const arg of n.arguments) {
+          if (ts.isCallExpression(arg) && ts.isIdentifier(arg.expression)) {
+            actions.push(arg.expression.text);
+          } else if (ts.isIdentifier(arg)) {
+            actions.push(arg.text);
+          }
+        }
+      }
+      if (ts.isIdentifier(n.expression)) {
+        const fnName = n.expression.text;
+        if (fnName === "emit" || fnName === "$emit") {
+          const firstArg = n.arguments[0];
+          if (firstArg && ts.isStringLiteral(firstArg)) {
+            const eventName = firstArg.text;
+            const handlerCandidate = "on" + eventName.charAt(0).toUpperCase() + eventName.slice(1);
+            actions.push(handlerCandidate);
+          }
+        }
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(handlerNode);
+  return actions;
 }
 
 function detectHookBindings(sourceFile: ts.SourceFile, importBindings: Map<string, ImportBinding>): HookBinding[] {
@@ -5780,21 +5896,98 @@ function buildRouteMap(files: { filePath: string; content: string }[]): RouteMap
     for (const [name, info] of routeEntries.slice(0, 10)) {
       console.log(`[frontend-analyzer]   Route: ${name} → ${info.route} [guards: ${info.guards.join(",")||"none"}]`);
     }
+    const sizeBefore = routeMap.size;
+    inferRoutesFromFilePaths(files, routeMap);
+    const inferred = routeMap.size - sizeBefore;
+    if (inferred > 0) {
+      console.log(`[frontend-analyzer] Supplemental file-path route inference: ${inferred} additional component mappings (total: ${routeMap.size})`);
+    }
   } else {
-    const routerFiles = files.filter(f => {
-      const ext = f.filePath.substring(f.filePath.lastIndexOf("."));
-      if (![".ts", ".js", ".tsx", ".jsx", ".vue"].includes(ext)) return false;
-      if (f.filePath.includes("node_modules")) return false;
-      const isRouterFile = f.filePath.toLowerCase().includes("router") || f.filePath.toLowerCase().endsWith("app.tsx") || f.filePath.toLowerCase().endsWith("app.jsx") || f.filePath.toLowerCase().endsWith("app.vue");
-      const hasImport = f.content.includes("<Route") || f.content.includes("useRoute") || f.content.includes("wouter") || f.content.includes("react-router");
-      return isRouterFile || hasImport;
-    });
-    if (routerFiles.length > 0) {
-      console.log(`[frontend-analyzer] Router extraction: 0 routes found from ${routerFiles.length} router-candidate files: ${routerFiles.map(f => f.filePath).join(", ")}`);
+    console.log(`[frontend-analyzer] No router routes found, inferring routes from file paths`);
+    const sizeBefore = routeMap.size;
+    inferRoutesFromFilePaths(files, routeMap);
+    const inferred = routeMap.size - sizeBefore;
+    if (inferred > 0) {
+      console.log(`[frontend-analyzer] File-path route inference: ${inferred} additional component mappings (total: ${routeMap.size})`);
     }
   }
 
   return routeMap;
+}
+
+function inferRoutesFromFilePaths(files: { filePath: string; content: string }[], routeMap: RouteMap): void {
+  const componentExtensions = [".tsx", ".jsx", ".vue"];
+  const skipDirs = new Set(["node_modules", "dist", "build", "__tests__", "test", "tests", "utils", "lib", "hooks", "types", "contexts", "services", "api", "helpers", "assets", "styles", "shared", "common", "config", "constants"]);
+  const skipFiles = new Set(["index", "app", "main", "vite-env.d", "setupTests", "reportWebVitals"]);
+  const sharedComponentPatterns = /^(Button|Input|Select|Modal|Dialog|Dropdown|Tooltip|Spinner|Loader|Loading|Icon|Badge|Card|Avatar|Table|Tabs|Tab|Header|Footer|Sidebar|Navbar|Nav|Layout|Wrapper|Container|Provider|ErrorBoundary|Suspense|Portal|Popover|Toast|Alert|Breadcrumb|Pagination|Skeleton|Divider|Label|Checkbox|Radio|Switch|Toggle|Textarea|Form|FormField|FormSection|FormGroup)$/i;
+  const screenDirs = new Set(["pages", "views", "screens"]);
+
+  const allComponentNames = new Set<string>();
+  for (const file of files) {
+    const ext = file.filePath.substring(file.filePath.lastIndexOf("."));
+    if (!componentExtensions.includes(ext)) continue;
+    const parts = file.filePath.replace(/\\/g, "/").split("/");
+    const fileName = parts[parts.length - 1].replace(/\.(vue|tsx|jsx|ts|js)$/, "");
+    if (/^[A-Z]/.test(fileName)) allComponentNames.add(fileName);
+  }
+
+  for (const file of files) {
+    const ext = file.filePath.substring(file.filePath.lastIndexOf("."));
+    if (!componentExtensions.includes(ext)) continue;
+
+    const parts = file.filePath.replace(/\\/g, "/").split("/");
+    if (parts.some(p => skipDirs.has(p.toLowerCase()))) continue;
+    if (file.filePath.includes("node_modules") || file.filePath.includes("dist/") || file.filePath.includes("build/")) continue;
+
+    const fileName = parts[parts.length - 1].replace(/\.(vue|tsx|jsx|ts|js)$/, "");
+    if (skipFiles.has(fileName.toLowerCase())) continue;
+
+    if (sharedComponentPatterns.test(fileName)) continue;
+
+    const parentDir = parts.length >= 2 ? parts[parts.length - 2].toLowerCase() : "";
+    const isInScreenDir = screenDirs.has(parentDir);
+    const isInComponentsDir = parentDir === "components";
+    const isInUiDir = parentDir === "ui";
+
+    if (isInUiDir) continue;
+
+    const isLikelyScreen = isInScreenDir ||
+      (isInComponentsDir && /^[A-Z]/.test(fileName) && !sharedComponentPatterns.test(fileName)) ||
+      (/^[A-Z]/.test(fileName) && (file.content.includes("return (") || file.content.includes("return(")));
+
+    if (!isLikelyScreen) continue;
+
+    const srcIdx = parts.findIndex(p => p === "src" || p === "app");
+    let routePath: string;
+    if (srcIdx >= 0) {
+      const relParts = parts.slice(srcIdx + 1);
+      const lastPart = relParts[relParts.length - 1].replace(/\.(vue|tsx|jsx|ts|js)$/, "");
+      const dirParts = relParts.slice(0, -1).filter(p => p !== "components" && p !== "pages" && p !== "views" && p !== "screens");
+      const kebabName = lastPart.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
+      routePath = "/" + [...dirParts, kebabName].join("/");
+    } else {
+      routePath = "/" + fileName.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
+    }
+
+    const guards: string[] = [];
+    const hasAuthImport = /\b(useAuth|withAuth|ProtectedRoute|RequireAuth|AuthGuard)\b/.test(file.content);
+    if (hasAuthImport) {
+      guards.push("requiresAuth");
+    }
+
+    const routeEntry = { route: routePath, guards };
+    const lowerName = fileName.toLowerCase();
+    if (!routeMap.has(lowerName)) routeMap.set(lowerName, routeEntry);
+
+    const kebab = fileName.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
+    if (kebab !== lowerName && !routeMap.has(kebab)) routeMap.set(kebab, routeEntry);
+
+    const noHyphens = lowerName.replace(/[-_]/g, "");
+    if (noHyphens !== lowerName && !routeMap.has(noHyphens)) routeMap.set(noHyphens, routeEntry);
+
+    const withSpaces = fileName.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
+    if (withSpaces !== lowerName && !routeMap.has(withSpaces)) routeMap.set(withSpaces, routeEntry);
+  }
 }
 
 function extractRoutesFromAST(sourceFile: ts.SourceFile, filePath: string): RouteDefinition[] {

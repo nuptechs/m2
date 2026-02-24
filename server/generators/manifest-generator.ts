@@ -84,6 +84,13 @@ export interface PermaCatManifest {
     entityCoverage: number;
     controllerCoverage: number;
     overallScore: number;
+    interactionBreakdown: {
+      total: number;
+      withEndpoint: number;
+      uiOnly: number;
+      httpRelevant: number;
+      httpRelevantResolved: number;
+    };
   };
 }
 
@@ -229,8 +236,18 @@ export function generateManifest(project: Project, entries: CatalogEntry[]): Per
     };
   });
 
-  const interactionsWithEndpoint = entries.filter(e => e.endpoint).length;
-  const endpointResolution = entries.length > 0 ? Math.round((interactionsWithEndpoint / entries.length) * 100) : 0;
+  const UI_STATE_SETTER = /^set[A-Z]/;
+  const UI_ONLY_EXACT = new Set(["stopPropagation", "preventDefault", "onChange", "onClose", "onBlur", "onFocus", "cancelSelection", "formatDate", "getSortIcon"]);
+  const isUiOnly = (entry: CatalogEntry): boolean => {
+    if (entry.endpoint) return false;
+    const handlerName = entry.interaction.replace(/^(button|input|element|link): /, "");
+    if (UI_STATE_SETTER.test(handlerName)) return true;
+    if (UI_ONLY_EXACT.has(handlerName)) return true;
+    return false;
+  };
+  const httpRelevantEntries = entries.filter(e => !isUiOnly(e));
+  const httpRelevantWithEndpoint = httpRelevantEntries.filter(e => e.endpoint).length;
+  const endpointResolution = httpRelevantEntries.length > 0 ? Math.round((httpRelevantWithEndpoint / httpRelevantEntries.length) * 100) : 0;
 
   const screensWithRoutes = allScreens.filter(s => s.route !== null && s.route !== undefined && s.route !== "").length;
   const routeCoverage = allScreens.length > 0 ? Math.round((screensWithRoutes / allScreens.length) * 100) : 0;
@@ -276,6 +293,13 @@ export function generateManifest(project: Project, entries: CatalogEntry[]): Per
       entityCoverage,
       controllerCoverage,
       overallScore,
+      interactionBreakdown: {
+        total: entries.length,
+        withEndpoint: entries.filter(e => e.endpoint).length,
+        uiOnly: entries.length - httpRelevantEntries.length,
+        httpRelevant: httpRelevantEntries.length,
+        httpRelevantResolved: httpRelevantWithEndpoint,
+      },
     },
   };
 }
