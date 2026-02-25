@@ -196,7 +196,7 @@ function extractThisWrapperCalls(body: ts.Node, sourceFile: ts.SourceFile, calle
   return results;
 }
 
-function buildLocalVarMap(body: ts.Node): Map<string, ts.Expression> {
+export function buildLocalVarMap(body: ts.Node): Map<string, ts.Expression> {
   const varMap = new Map<string, ts.Expression>();
   const visit = (node: ts.Node) => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
@@ -271,7 +271,7 @@ function walkForHttpCalls(body: ts.Node, sourceFile: ts.SourceFile, httpClients:
   walk(body);
 }
 
-function extractHttpCallFromExpression(node: ts.CallExpression, sourceFile: ts.SourceFile, httpClients: ImportedHttpClients, callerName: string, varMap?: Map<string, ts.Expression>): HttpCall | null {
+export function extractHttpCallFromExpression(node: ts.CallExpression, sourceFile: ts.SourceFile, httpClients: ImportedHttpClients, callerName: string, varMap?: Map<string, ts.Expression>): HttpCall | null {
   const expr = node.expression;
 
   if (ts.isPropertyAccessExpression(expr)) {

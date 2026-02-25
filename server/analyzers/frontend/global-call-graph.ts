@@ -3,8 +3,7 @@ import * as vueSfc from "@vue/compiler-sfc";
 import type { HttpCall, GlobalCallGraphNode, GlobalCallGraph, HttpServiceMap, ImportBinding, DestructuredBinding, VariableOrigin, HookBinding } from "./types";
 import { parseTypeScript, getLineNumber } from "./parsers";
 import { ImportedHttpClients } from "./http-clients";
-import { normalizeModulePath } from "./http-service-map";
-import { extractHttpCallFromExpression, buildLocalVarMap } from "../frontend-analyzer";
+import { normalizeModulePath, extractHttpCallFromExpression, buildLocalVarMap } from "./http-service-map";
 
 import ts = _ts;
 
