@@ -197,7 +197,7 @@ export class AnalysisPipeline {
       this.progress("Security", `Found ${securityFindings.length} findings (${criticalCount} critical, ${highCount} high). Coverage: ${securityMetrics.coveragePercent}%`);
 
       const graphSummary = appGraph.toJSON();
-      await this.finalize(analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length, appGraph);
+      await this.finalize(analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length, appGraph, catalogEntryData);
       await this.saveSnapshot(analysisRun.id, projectId, created);
 
       let cacheStatus = "full analysis";
@@ -209,7 +209,7 @@ export class AnalysisPipeline {
 
       const result = this.buildResult(
         analysisRun.id, projectId, frontendInteractions.length, endpointImpacts.length,
-        appGraph, graphSummary, created.length, endpointImpacts, resolutionErrors
+        appGraph, graphSummary, created.length, endpointImpacts, resolutionErrors, catalogEntryData
       );
       return { ...result, cacheStatus, securityFindings, securityMetrics };
     } catch (error) {
@@ -311,16 +311,29 @@ export class AnalysisPipeline {
     }
   }
 
+  private countTotalEntities(appGraph: any, catalogEntries: InsertCatalogEntry[]): number {
+    const extractedEntities = appGraph.getNodesByType("ENTITY").length;
+    if (extractedEntities > 0) return extractedEntities;
+    const inferredEntityNames = new Set<string>();
+    for (const entry of catalogEntries) {
+      if (entry.entitiesTouched && Array.isArray(entry.entitiesTouched)) {
+        for (const e of entry.entitiesTouched) inferredEntityNames.add(e);
+      }
+    }
+    return inferredEntityNames.size;
+  }
+
   private async finalize(
     analysisRunId: number, projectId: number,
-    totalInteractions: number, totalEndpoints: number, appGraph: any
+    totalInteractions: number, totalEndpoints: number, appGraph: any,
+    catalogEntries: InsertCatalogEntry[]
   ) {
     await storage.updateAnalysisRun(analysisRunId, {
       status: "completed",
       completedAt: new Date(),
       totalInteractions,
       totalEndpoints,
-      totalEntities: appGraph.getNodesByType("ENTITY").length,
+      totalEntities: this.countTotalEntities(appGraph, catalogEntries),
     });
     await storage.updateProjectStatus(projectId, "completed");
   }
@@ -329,14 +342,16 @@ export class AnalysisPipeline {
     analysisRunId: number, projectId: number,
     totalInteractions: number, totalEndpoints: number,
     appGraph: any, graphSummary: any, catalogEntries: number,
-    endpointImpacts: any[], resolutionErrors: string[]
+    endpointImpacts: any[], resolutionErrors: string[],
+    catalogEntryData: InsertCatalogEntry[]
   ): AnalysisResult {
+    const totalEntities = this.countTotalEntities(appGraph, catalogEntryData);
     return {
       analysisRunId,
       projectId,
       totalInteractions,
       totalEndpoints,
-      totalEntities: appGraph.getNodesByType("ENTITY").length,
+      totalEntities,
       catalogEntries,
       graph: {
         totalNodes: graphSummary.nodes.length,
@@ -345,7 +360,7 @@ export class AnalysisPipeline {
           controllers: appGraph.getNodesByType("CONTROLLER").length,
           services: appGraph.getNodesByType("SERVICE").length,
           repositories: appGraph.getNodesByType("REPOSITORY").length,
-          entities: appGraph.getNodesByType("ENTITY").length,
+          entities: totalEntities,
         },
       },
       endpointImpacts: endpointImpacts.map((ei) => ({

@@ -438,9 +438,12 @@ export default function CatalogPage() {
           variant: "destructive",
         });
       } else {
+        const entityLabel = (data.totalEntities || 0) > 0
+          ? `${data.totalEntities} entities`
+          : "no entities detected";
         toast({
           title: "Analysis complete",
-          description: `Catalog generated with ${data.catalogEntries || 0} entries and ${data.totalEntities || 0} entities.`,
+          description: `Catalog generated with ${data.catalogEntries || 0} entries and ${entityLabel}.`,
         });
       }
     },
