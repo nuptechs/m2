@@ -1,10 +1,10 @@
 [build]
-builder = "nixpacks"
-buildCommand = "npm run build"
-nixpacksConfigPath = "nixpacks.toml"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "npm run start"
+preDeployCommand = "echo 'skip pre-deploy'"
 healthcheckPath = "/api/projects"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"

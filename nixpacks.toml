@@ -1,2 +1,5 @@
+[phases.setup]
+nixPkgs = ["jdk17", "maven"]
+
 [phases.install]
 cmds = ["npm install"]

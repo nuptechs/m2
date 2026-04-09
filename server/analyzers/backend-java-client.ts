@@ -21,7 +21,7 @@ const JAR_PATH = path.resolve(
 let javaProcess: ChildProcess | null = null;
 let engineReady = false;
 
-async function waitForEngine(maxWaitMs = 15000): Promise<void> {
+async function waitForEngine(maxWaitMs = 60000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     try {
@@ -53,7 +53,7 @@ async function ensureEngineRunning(): Promise<void> {
     javaProcess = null;
   }
 
-  javaProcess = spawn("java", ["-Xmx2g", "-Xms512m", "-jar", JAR_PATH, String(JAVA_ENGINE_PORT)], {
+  javaProcess = spawn("java", ["-Xmx512m", "-Xms128m", "-jar", JAR_PATH, String(JAVA_ENGINE_PORT)], {
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
   });
