@@ -90,6 +90,32 @@ export async function registerRoutes(
 
   app.use("/api", apiAuthMiddleware);
 
+  // ─── Auth info (OIDC users) ──────────────────────────────────────
+  app.get("/api/auth/me", (req, res) => {
+    if ((req as any).oidcAuth && (req as any).oidcUser) {
+      const user = (req as any).oidcUser;
+      return res.json({
+        authenticated: true,
+        provider: "oidc",
+        sub: user.sub,
+        email: user.email,
+        name: user.name,
+        permissions: user.permissions,
+        organizationId: user.organizationId,
+        licenseTier: user.licenseTier,
+      });
+    }
+    if ((req as any).apiKeyAuth) {
+      return res.json({
+        authenticated: true,
+        provider: "api-key",
+        keyPrefix: (req as any).apiKey?.keyPrefix,
+        projectScope: (req as any).apiKey?.projectScope,
+      });
+    }
+    res.json({ authenticated: false });
+  });
+
   app.post("/api/keys", async (req, res) => {
     try {
       const { name, projectScope } = req.body;
