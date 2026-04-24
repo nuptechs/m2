@@ -15,6 +15,7 @@ import { generatePolicyMatrix } from "./generators/policy-matrix-generator";
 import { generateKeycloakRealm } from "./generators/keycloak-realm-generator";
 import { generateOpaRego } from "./generators/opa-rego-generator";
 import { generateComplianceReport } from "./generators/compliance-report-generator";
+import { generateNupidentityBundle, generateNupidentityRunnerScript } from "./generators/nupidentity-generator";
 import { AnalysisPipeline } from "./pipeline/analysis-pipeline";
 import { apiAuthMiddleware, generateApiKey, hashApiKey } from "./middleware/api-auth";
 import { z } from "zod";
@@ -226,6 +227,15 @@ export async function registerRoutes(
         output.keycloakRealm = generateKeycloakRealm(manifest, findings);
       } else if (format === "opa-rego") {
         output.opaRego = generateOpaRego(manifest);
+      } else if (format === "nupidentity") {
+        output.nupidentity = generateNupidentityBundle(manifest, {
+          systemId: options?.nupidentity?.systemId || project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+          systemName: options?.nupidentity?.systemName || project.name,
+          systemDescription: options?.nupidentity?.systemDescription || project.description || undefined,
+          organizationId: options?.nupidentity?.organizationId,
+          apiUrl: options?.nupidentity?.apiUrl,
+          callbackUrl: options?.nupidentity?.callbackUrl,
+        });
       } else if (format === "compliance-report") {
         const findings = await storage.getSecurityFindings(project.id);
         output.complianceReport = generateComplianceReport(manifest, findings, {
@@ -239,6 +249,14 @@ export async function registerRoutes(
         const findings = await storage.getSecurityFindings(project.id);
         output.keycloakRealm = generateKeycloakRealm(manifest, findings);
         output.opaRego = generateOpaRego(manifest);
+        output.nupidentity = generateNupidentityBundle(manifest, {
+          systemId: options?.nupidentity?.systemId || project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+          systemName: options?.nupidentity?.systemName || project.name,
+          systemDescription: options?.nupidentity?.systemDescription || project.description || undefined,
+          organizationId: options?.nupidentity?.organizationId,
+          apiUrl: options?.nupidentity?.apiUrl,
+          callbackUrl: options?.nupidentity?.callbackUrl,
+        });
         output.complianceReport = generateComplianceReport(manifest, findings, {
           name: project.name,
           analyzedAt: new Date().toISOString(),
@@ -294,6 +312,14 @@ export async function registerRoutes(
         output.keycloakRealm = generateKeycloakRealm(manifest, findings);
       }
       if (format === "opa-rego" || format === "all") output.opaRego = generateOpaRego(manifest);
+      if (format === "nupidentity" || format === "all") {
+        output.nupidentity = generateNupidentityBundle(manifest, {
+          systemId: (req.body.systemId as string) || projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+          systemName: (req.body.systemName as string) || projectName,
+          systemDescription: project.description || undefined,
+          organizationId: (req.body.organizationId as string) || undefined,
+        });
+      }
       if (format === "compliance-report" || format === "all") {
         const findings = await storage.getSecurityFindings(project.id);
         output.complianceReport = generateComplianceReport(manifest, findings, {
@@ -1059,6 +1085,26 @@ export async function registerRoutes(
           return res.send(regoResult.policy);
         }
 
+        case "nupidentity": {
+          const bundle = generateNupidentityBundle(manifest, {
+            systemId: (req.query.systemId as string) || project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+            systemName: (req.query.systemName as string) || project.name,
+            systemDescription: project.description || undefined,
+            organizationId: (req.query.organizationId as string) || undefined,
+            apiUrl: (req.query.apiUrl as string) || undefined,
+            callbackUrl: (req.query.callbackUrl as string) || undefined,
+          });
+          res.setHeader("Content-Type", "application/json");
+          res.setHeader("Content-Disposition", `attachment; filename="nupidentity-bundle.json"`);
+          return res.json(bundle);
+        }
+
+        case "nupidentity-runner": {
+          res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+          res.setHeader("Content-Disposition", `attachment; filename="nupidentity-runner.js"`);
+          return res.send(generateNupidentityRunnerScript());
+        }
+
         case "compliance-report": {
           const reportFindings = await storage.getSecurityFindings(projectId);
           const reportHtml = generateComplianceReport(manifest, reportFindings, {
@@ -1077,6 +1123,12 @@ export async function registerRoutes(
           const allFindings = await storage.getSecurityFindings(projectId);
           const allKeycloakRealm = generateKeycloakRealm(manifest, allFindings);
           const allOpaRego = generateOpaRego(manifest);
+          const allNupidentity = generateNupidentityBundle(manifest, {
+            systemId: (req.query.systemId as string) || project!.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+            systemName: (req.query.systemName as string) || project!.name,
+            systemDescription: project!.description || undefined,
+            organizationId: (req.query.organizationId as string) || undefined,
+          });
           const allComplianceReport = generateComplianceReport(manifest, allFindings, {
             name: project!.name,
             analyzedAt: project!.createdAt?.toISOString() || new Date().toISOString(),
@@ -1089,12 +1141,13 @@ export async function registerRoutes(
             keycloakRealm: allKeycloakRealm,
             opaRego: allOpaRego.policy,
             opaBundleData: allOpaRego.bundle.data,
+            nupidentity: allNupidentity,
             complianceReport: allComplianceReport,
           });
         }
 
         default:
-          return res.status(400).json({ message: `Unknown format: ${format}. Use: manifest, agents-md, openapi, policy-matrix, keycloak-realm, opa-rego, compliance-report, all` });
+          return res.status(400).json({ message: `Unknown format: ${format}. Use: manifest, agents-md, openapi, policy-matrix, keycloak-realm, opa-rego, nupidentity, nupidentity-runner, compliance-report, all` });
       }
     } catch (error) {
       console.error("Error generating manifest:", error);
