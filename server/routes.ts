@@ -1028,6 +1028,70 @@ export async function registerRoutes(
     }
   });
 
+  // ─────────────────────────────────────────────
+  // GET /api/projects/:projectId/schema-fields
+  //
+  // Canonical schema-field catalog feed for the Sentinel Field Death detector
+  // (Onda 5 / Vácuo 5). Each entry is `{entity, fieldName, kind, type?,
+  // isId?, isSensitive?, repo?}` — exactly the shape the detector expects in
+  // its `schemaFields[]` input. Source data comes from the latest catalog
+  // entries' enriched entity metadata extracted by the Java analyzer.
+  //
+  // No auth (mirrors the other GET /api/* endpoints in this server). The
+  // detector run on the Sentinel side IS gated.
+  // ─────────────────────────────────────────────
+  app.get("/api/projects/:projectId/schema-fields", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      if (isNaN(projectId)) return res.status(400).json({ message: "Invalid project ID" });
+      const project = await storage.getProject(projectId);
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      const entries = await storage.getCatalogEntries(projectId);
+      if (entries.length === 0) {
+        return res.status(404).json({ message: "No catalog entries found. Run analysis first." });
+      }
+
+      const manifest = generateManifest(project, entries);
+      const schemaFields: Array<{
+        entity: string;
+        fieldName: string;
+        kind: "column";
+        type?: string;
+        isId?: boolean;
+        isSensitive?: boolean;
+        repo?: string;
+      }> = [];
+
+      const repo = (project.gitRepoUrl as string | null) || undefined;
+      for (const ent of manifest.entities) {
+        for (const f of ent.fieldMetadata || []) {
+          schemaFields.push({
+            entity: ent.name,
+            fieldName: f.name,
+            kind: "column",
+            ...(f.type ? { type: f.type } : {}),
+            ...(f.isId ? { isId: true } : {}),
+            ...(f.isSensitive ? { isSensitive: true } : {}),
+            ...(repo ? { repo } : {}),
+          });
+        }
+      }
+
+      return res.json({
+        projectId: project.id,
+        projectName: project.name,
+        totalEntities: manifest.entities.length,
+        totalFields: schemaFields.length,
+        schemaFields,
+      });
+    } catch (err) {
+      console.error("[schema-fields] error:", err);
+      return res
+        .status(500)
+        .json({ message: err instanceof Error ? err.message : "schema-fields export failed" });
+    }
+  });
+
   app.get("/api/manifest/:projectId", async (req, res) => {
     try {
       const projectId = parseInt(req.params.projectId);
